@@ -109,6 +109,9 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Medallion Club Server running on http://localhost:${PORT}`);
+    void tradingSystem.start().catch((e) => {
+      console.error('[server] tradingSystem.start failed:', e);
+    });
   });
 }
 
