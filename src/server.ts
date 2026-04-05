@@ -4,13 +4,13 @@ import cors from 'cors';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { PortfolioManager } from './src/backend/portfolio/PortfolioManager.ts';
-import { TradingSystem } from './src/backend/TradingSystem.ts';
-import { ScalpingEngine } from './src/backend/scalping/ScalpingEngine.ts';
-import { WebSocketManager } from './src/backend/data/WebSocketManager.ts';
-import { DataLayer } from './src/backend/DataLayer.ts';
-import { ScoringEngine } from './src/backend/Engine.ts';
-import { runBacktest } from './src/backend/backtest/BacktestRunner.ts';
+import { PortfolioManager } from './backend/portfolio/PortfolioManager.ts';
+import { TradingSystem } from './backend/TradingSystem.ts';
+import { ScalpingEngine } from './backend/scalping/ScalpingEngine.ts';
+import { WebSocketManager } from './backend/data/WebSocketManager.ts';
+import { DataLayer } from './backend/DataLayer.ts';
+import { ScoringEngine } from './backend/Engine.ts';
+import { runBacktest } from './backend/backtest/BacktestRunner.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -127,7 +127,7 @@ async function startServer() {
     const swingStats = swingEngine.getPerformanceStats();
     const scalpStats = scalpEngine.getPerformanceStats();
 
-    // Combined across both engines
+    // Combined across both engines (PnL metrics are net of fees)
     const combined = {
       closedTrades: swingStats.closedTrades + scalpStats.closedTrades,
       wins:         swingStats.wins  + scalpStats.wins,
@@ -135,6 +135,7 @@ async function startServer() {
       winRate: (swingStats.closedTrades + scalpStats.closedTrades) > 0
         ? (swingStats.wins + scalpStats.wins) / (swingStats.closedTrades + scalpStats.closedTrades)
         : 0,
+      totalNetPnl: swingStats.totalNetPnl + scalpStats.totalNetPnl,
     };
 
     res.json({ combined, swing: swingStats, scalp: scalpStats });
@@ -164,6 +165,7 @@ async function startServer() {
   // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
+      root: path.join(__dirname, '..'),
       server: { middlewareMode: true, hmr: false },
       appType: 'spa',
     });

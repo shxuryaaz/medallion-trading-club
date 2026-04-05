@@ -92,7 +92,7 @@ export const ScalpDashboard: React.FC<ScalpDashboardProps> = ({
 }) => {
   const scalpTrades = trades.filter((t) => t.source === "scalp");
 
-  const rowForTrade = (trade: any) => {
+  const metricsForScalpTrade = (trade: any) => {
     const pos =
       trade.status === "OPEN"
         ? positions.find((p: any) => p.tradeId === trade.id && p.engineId === "scalp")
@@ -106,6 +106,11 @@ export const ScalpDashboard: React.FC<ScalpDashboardProps> = ({
           ? trade.pnl
           : null;
     const score = trade.scalpEntryQuality?.score;
+    return { cur, pnl, score };
+  };
+
+  const rowForTrade = (trade: any) => {
+    const { cur, pnl, score } = metricsForScalpTrade(trade);
 
     return (
       <tr key={trade.id} className="border-b border-white/[0.06] hover:bg-white/[0.02]">
@@ -257,7 +262,55 @@ export const ScalpDashboard: React.FC<ScalpDashboardProps> = ({
         {/* Section 4 — Scalp trades */}
         <section>
           <h3 className="text-[10px] uppercase tracking-widest text-white/40 mb-3">Scalp trades</h3>
-          <div className="border border-white/10 rounded-lg overflow-x-auto">
+          {/* Mobile: stacked cards (no horizontal table scroll) */}
+          <div className="md:hidden border border-white/10 rounded-lg divide-y divide-white/10 overflow-hidden">
+            {scalpTrades.slice(0, 24).map((trade) => {
+              const { cur, pnl, score } = metricsForScalpTrade(trade);
+              return (
+                <div key={trade.id} className="px-3 py-3 space-y-2">
+                  <div className="flex justify-between items-start gap-2">
+                    <div className="min-w-0">
+                      <div className="font-medium text-sm text-white truncate">{trade.symbol}</div>
+                      <div className="font-mono text-[11px] text-white/40 mt-0.5">{safeFormatTime(trade.timestamp)}</div>
+                    </div>
+                    <span
+                      className={`text-[10px] font-bold uppercase tracking-widest shrink-0 ${trade.status === "OPEN" ? "text-white animate-pulse" : "text-white/30"}`}
+                    >
+                      {trade.status}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
+                    <div>
+                      <span className="text-white/35 uppercase text-[9px] tracking-wider block mb-0.5">Entry</span>
+                      ${trade.entryPrice?.toFixed(4) ?? "—"}
+                    </div>
+                    <div>
+                      <span className="text-white/35 uppercase text-[9px] tracking-wider block mb-0.5">Current</span>
+                      ${typeof cur === "number" ? cur.toFixed(4) : "—"}
+                    </div>
+                    <div>
+                      <span className="text-white/35 uppercase text-[9px] tracking-wider block mb-0.5">PnL</span>
+                      {pnl == null ? (
+                        "—"
+                      ) : pnl >= 0 ? (
+                        <span className="text-emerald-400">+{pnl.toFixed(2)}</span>
+                      ) : (
+                        <span className="text-red-400">{pnl.toFixed(2)}</span>
+                      )}
+                    </div>
+                    <div>
+                      <span className="text-white/35 uppercase text-[9px] tracking-wider block mb-0.5">Score</span>
+                      <span className="text-white/80">{score != null ? score : "—"}</span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            {scalpTrades.length === 0 && (
+              <div className="py-10 text-center text-white/30 text-[10px] uppercase tracking-widest">No scalp trades</div>
+            )}
+          </div>
+          <div className="hidden md:block border border-white/10 rounded-lg overflow-x-auto">
             <table className="w-full text-left text-xs min-w-[640px]">
               <thead>
                 <tr className="text-[10px] uppercase tracking-widest text-white/40 border-b border-white/10">

@@ -9,7 +9,17 @@
 @layer base {
   body {
     @apply bg-black text-white antialiased selection:bg-white selection:text-black;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
   }
+}
+
+/* Mobile: reserve space for home indicator + bottom nav */
+.pb-nav-mobile {
+  padding-bottom: max(5.5rem, calc(4.5rem + env(safe-area-inset-bottom, 0px)));
+}
+
+.pt-safe {
+  padding-top: env(safe-area-inset-top, 0px);
 }
 
 .glass {

@@ -12,6 +12,7 @@ import {
 import type { TradeLog } from './types';
 import { StateStore } from './persistence/StateStore';
 import { PortfolioManager } from './portfolio/PortfolioManager';
+import { closedTradeNetAmount, entryExitFees, minTpDistanceForFees } from './fees';
 
 export type { TradeLog } from './types';
 
@@ -193,11 +194,11 @@ export class TradingSystem {
 
   private buildAiEnrichment(market: ReturnType<typeof analyzeMarketForTrading>): AiEnrichmentContext {
     const recent = this.tradeHistory
-      .filter((t) => t.status === 'CLOSED' && typeof t.pnl === 'number')
+      .filter((t) => closedTradeNetAmount(t) != null)
       .slice(-5)
       .reverse()
       .map((t) => {
-        const p = t.pnl as number;
+        const p = closedTradeNetAmount(t) as number;
         const outcome: 'win' | 'loss' | 'flat' = p > 0 ? 'win' : p < 0 ? 'loss' : 'flat';
         return { symbol: t.symbol, side: t.side, pnl: p, outcome };
       });
@@ -210,15 +211,35 @@ export class TradingSystem {
   }
 
   getPerformanceStats() {
-    const closed = this.tradeHistory.filter((t) => t.status === 'CLOSED' && typeof t.pnl === 'number');
-    const wins = closed.filter((t) => (t.pnl as number) > 0);
-    const losses = closed.filter((t) => (t.pnl as number) < 0);
+    const closed = this.tradeHistory.filter((t) => closedTradeNetAmount(t) != null);
+    const wins = closed.filter((t) => (closedTradeNetAmount(t) as number) > 0);
+    const losses = closed.filter((t) => (closedTradeNetAmount(t) as number) < 0);
     const n = closed.length;
     const winRate = n > 0 ? wins.length / n : 0;
-    const avgProfit = wins.length > 0 ? wins.reduce((s, t) => s + (t.pnl as number), 0) / wins.length : 0;
+    const net = (t: TradeLog) => closedTradeNetAmount(t) as number;
+    const avgProfit = wins.length > 0 ? wins.reduce((s, t) => s + net(t), 0) / wins.length : 0;
     const avgLoss =
-      losses.length > 0 ? losses.reduce((s, t) => s + (t.pnl as number), 0) / losses.length : 0;
-    return { closedTrades: n, wins: wins.length, losses: losses.length, winRate, avgProfit, avgLoss };
+      losses.length > 0 ? losses.reduce((s, t) => s + net(t), 0) / losses.length : 0;
+    const sumWins = wins.reduce((s, t) => s + net(t), 0);
+    const sumLosses = losses.reduce((s, t) => s + net(t), 0);
+    const profitFactor =
+      losses.length === 0 ? (sumWins > 0 ? null : 0) : sumWins / Math.abs(sumLosses);
+    const avgWinToAvgLoss =
+      wins.length > 0 && losses.length > 0 && avgLoss !== 0
+        ? avgProfit / Math.abs(avgLoss)
+        : null;
+    const totalNetPnl = closed.reduce((s, t) => s + net(t), 0);
+    return {
+      closedTrades: n,
+      wins: wins.length,
+      losses: losses.length,
+      winRate,
+      avgProfit,
+      avgLoss,
+      profitFactor,
+      avgWinToAvgLoss,
+      totalNetPnl,
+    };
   }
 
   async refreshOpenPositionMarks(): Promise<void> {
@@ -365,6 +386,15 @@ export class TradingSystem {
       return;
     }
 
+    const tpDist = Math.abs(position.takeProfit - price);
+    const minEdge = minTpDistanceForFees(price);
+    if (tpDist < minEdge) {
+      this.addLog(
+        `SKIP ${symbol} ${side} cause=fee_min_edge(tpDist=${tpDist.toFixed(6)} need>=${minEdge.toFixed(6)})`
+      );
+      return;
+    }
+
     const tradeId = randomUUID();
     position.tradeId  = tradeId;
     position.symbol   = symbol;
@@ -429,32 +459,39 @@ export class TradingSystem {
       return;
     }
 
-    const pnl =
+    const grossPnl =
       pos.side === 'LONG'
         ? (price - pos.entryPrice) * pos.amount
         : (pos.entryPrice - price) * pos.amount;
 
-    // Portfolio: credit PnL to shared balance + remove from risk registry
-    this.portfolio.closeTrade(pos.tradeId, pnl);
+    const { entryFee, exitFee } = entryExitFees(pos.entryPrice, price, pos.amount);
+    const netPnl = grossPnl - entryFee - exitFee;
+
+    // Portfolio: credit net PnL + remove from risk registry
+    this.portfolio.closeTrade(pos.tradeId, netPnl);
 
     trade.exitPrice     = price;
-    trade.pnl           = pnl;
+    trade.grossPnl      = grossPnl;
+    trade.entryFee      = entryFee;
+    trade.exitFee       = exitFee;
+    trade.netPnl        = netPnl;
+    trade.pnl           = netPnl;
     trade.status        = 'CLOSED';
     trade.exitTimestamp = Date.now();
 
-    this.addLog(`CLOSE ${pos.symbol} @ ${price} (${reason}). PnL: ${pnl.toFixed(2)}`);
+    this.addLog(
+      `CLOSE ${pos.symbol} @ ${price} (${reason}). Net ${netPnl.toFixed(2)} (gross ${grossPnl.toFixed(2)} fees ${(entryFee + exitFee).toFixed(2)})`
+    );
 
     this.symbolLastClosedAt.set(pos.symbol, Date.now());
     this.activePositions.splice(index, 1);
 
     // Loss streak check (swing-specific — 3 consecutive losses)
-    const closed = this.tradeHistory.filter(
-      (t) => t.status === 'CLOSED' && typeof t.pnl === 'number'
-    );
+    const closed = this.tradeHistory.filter((t) => closedTradeNetAmount(t) != null);
     const last3 = closed.slice(-3);
     if (
       last3.length === 3 &&
-      last3.every((t) => (t.pnl as number) < 0) &&
+      last3.every((t) => (closedTradeNetAmount(t) as number) < 0) &&
       Date.now() >= this.lossStreakPauseUntil
     ) {
       this.lossStreakPauseUntil = Date.now() + LOSS_STREAK_PAUSE_MS;

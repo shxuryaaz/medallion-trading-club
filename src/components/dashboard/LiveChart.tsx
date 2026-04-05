@@ -22,6 +22,8 @@ export const LiveChart: React.FC<LiveChartProps> = ({ data, symbol }) => {
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
+    const chartHeight = () => (typeof window !== 'undefined' && window.innerWidth < 768 ? 260 : 400);
+
     const chart = createChart(chartContainerRef.current, {
       layout: {
         background: { type: ColorType.Solid, color: 'transparent' },
@@ -32,7 +34,7 @@ export const LiveChart: React.FC<LiveChartProps> = ({ data, symbol }) => {
         horzLines: { color: 'rgba(255, 255, 255, 0.05)' },
       },
       width: chartContainerRef.current.clientWidth,
-      height: 400,
+      height: chartHeight(),
       timeScale: {
         borderColor: 'rgba(255, 255, 255, 0.1)',
         timeVisible: true,
@@ -56,7 +58,10 @@ export const LiveChart: React.FC<LiveChartProps> = ({ data, symbol }) => {
 
     const handleResize = () => {
       if (chartContainerRef.current) {
-        chart.applyOptions({ width: chartContainerRef.current.clientWidth });
+        chart.applyOptions({
+          width: chartContainerRef.current.clientWidth,
+          height: chartHeight(),
+        });
       }
     };
 
@@ -75,18 +80,18 @@ export const LiveChart: React.FC<LiveChartProps> = ({ data, symbol }) => {
   }, [data]);
 
   return (
-    <div className="relative glass p-6 rounded-xl overflow-hidden">
-      <div className="flex justify-between items-center mb-6">
-        <h3 className="text-sm font-bold uppercase tracking-widest flex items-center gap-2">
-          <div className="w-2 h-2 bg-white rounded-full animate-pulse" />
-          Live Market: {symbol}
+    <div className="relative glass p-4 sm:p-6 rounded-xl overflow-hidden">
+      <div className="flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-center mb-4 sm:mb-6">
+        <h3 className="text-xs sm:text-sm font-bold uppercase tracking-widest flex items-center gap-2 min-w-0">
+          <div className="w-2 h-2 bg-white rounded-full animate-pulse shrink-0" />
+          <span className="truncate">Live: {symbol}</span>
         </h3>
-        <div className="flex gap-4 text-[10px] uppercase tracking-widest text-white/40">
-          <span>15M Interval</span>
-          <span>Binance Spot</span>
+        <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px] uppercase tracking-widest text-white/40 shrink-0">
+          <span>15M</span>
+          <span>Binance</span>
         </div>
       </div>
-      <div ref={chartContainerRef} className="w-full" />
+      <div ref={chartContainerRef} className="w-full touch-pan-x" />
     </div>
   );
 };

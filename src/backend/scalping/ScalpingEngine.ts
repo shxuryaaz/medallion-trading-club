@@ -7,6 +7,7 @@ import type { TradeLog } from '../types';
 import { PortfolioManager } from '../portfolio/PortfolioManager';
 import { WebSocketManager } from '../data/WebSocketManager';
 import { StateStore } from '../persistence/StateStore';
+import { closedTradeNetAmount, entryExitFees, minTpDistanceForFees } from '../fees';
 
 // ── Indicator helpers (inlined — no dependency on swing engine math) ──────────
 
@@ -542,20 +543,22 @@ export class ScalpingEngine {
   }
 
   getPerformanceStats() {
-    const closed = this.tradeHistory.filter(t => t.status === 'CLOSED' && typeof t.pnl === 'number');
-    const wins   = closed.filter(t => (t.pnl as number) > 0);
-    const losses = closed.filter(t => (t.pnl as number) < 0);
+    const closed = this.tradeHistory.filter(t => closedTradeNetAmount(t) != null);
+    const net = (t: TradeLog) => closedTradeNetAmount(t) as number;
+    const wins   = closed.filter(t => net(t) > 0);
+    const losses = closed.filter(t => net(t) < 0);
     const n      = closed.length;
-    const avgProfit = wins.length   > 0 ? wins.reduce((s, t)   => s + (t.pnl as number), 0) / wins.length   : 0;
-    const avgLoss   = losses.length > 0 ? losses.reduce((s, t) => s + (t.pnl as number), 0) / losses.length : 0;
-    const sumWins   = wins.reduce((s, t) => s + (t.pnl as number), 0);
-    const sumLosses = losses.reduce((s, t) => s + (t.pnl as number), 0);
+    const avgProfit = wins.length   > 0 ? wins.reduce((s, t)   => s + net(t), 0) / wins.length   : 0;
+    const avgLoss   = losses.length > 0 ? losses.reduce((s, t) => s + net(t), 0) / losses.length : 0;
+    const sumWins   = wins.reduce((s, t) => s + net(t), 0);
+    const sumLosses = losses.reduce((s, t) => s + net(t), 0);
     const profitFactor =
       losses.length === 0 ? (sumWins > 0 ? null : 0) : sumWins / Math.abs(sumLosses);
     const avgWinToAvgLoss =
       wins.length > 0 && losses.length > 0 && avgLoss !== 0
         ? avgProfit / Math.abs(avgLoss)
         : null;
+    const totalNetPnl = closed.reduce((s, t) => s + net(t), 0);
     return {
       closedTrades: n,
       wins: wins.length,
@@ -565,6 +568,7 @@ export class ScalpingEngine {
       avgLoss,
       profitFactor,
       avgWinToAvgLoss,
+      totalNetPnl,
     };
   }
 
@@ -900,6 +904,14 @@ export class ScalpingEngine {
     const tp      = side === 'LONG' ? price + tpDist : price - tpDist;
     const riskAmt = slDist * amount; // dollars at risk if SL hit
 
+    const minEdge = minTpDistanceForFees(price);
+    if (tpDist < minEdge) {
+      this.addLog(
+        `SKIP ${symbol} ${side} cause=fee_min_edge(tpDist=${tpDist.toFixed(6)} need>=${minEdge.toFixed(6)})`
+      );
+      return;
+    }
+
     // Portfolio gate — synchronous check + register (atomic in Node.js)
     const allocation = this.portfolio.requestCapital(ENGINE_ID, symbol, riskAmt);
     if (!allocation.approved) {
@@ -960,28 +972,35 @@ export class ScalpingEngine {
   private closePosition(index: number, price: number, reason: string): void {
     const pos = this.activePositions[index];
 
-    const pnl = pos.side === 'LONG'
+    const grossPnl = pos.side === 'LONG'
       ? (price - pos.entryPrice) * pos.amount
       : (pos.entryPrice - price) * pos.amount;
+
+    const { entryFee, exitFee } = entryExitFees(pos.entryPrice, price, pos.amount);
+    const netPnl = grossPnl - entryFee - exitFee;
 
     // Update trade log
     const trade = this.tradeHistory.find(t => t.id === pos.tradeId);
     if (trade) {
       trade.exitPrice     = price;
-      trade.pnl           = pnl;
+      trade.grossPnl      = grossPnl;
+      trade.entryFee      = entryFee;
+      trade.exitFee       = exitFee;
+      trade.netPnl        = netPnl;
+      trade.pnl           = netPnl;
       trade.status        = 'CLOSED';
       trade.exitTimestamp = Date.now();
     }
 
-    // Portfolio: remove from risk registry and credit PnL to shared balance
-    this.portfolio.closeTrade(pos.tradeId, pnl);
+    // Portfolio: remove from risk registry and credit net PnL to shared balance
+    this.portfolio.closeTrade(pos.tradeId, netPnl);
 
     this.activePositions.splice(index, 1);
     this.symbolLastClosedAt.set(pos.symbol, Date.now());
 
     this.addLog(
       `CLOSE ${pos.symbol} @ ${price.toFixed(4)} (${reason}) ` +
-      `PnL=${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} ` +
+      `Net=${netPnl >= 0 ? '+' : ''}${netPnl.toFixed(2)} gross=${grossPnl.toFixed(2)} fees=${(entryFee + exitFee).toFixed(2)} ` +
       `balance=${this.portfolio.getBalance().toFixed(2)}`
     );
 
@@ -993,12 +1012,12 @@ export class ScalpingEngine {
 
   private checkLossStreak(): void {
     const recent = this.tradeHistory
-      .filter(t => t.status === 'CLOSED' && typeof t.pnl === 'number')
+      .filter(t => closedTradeNetAmount(t) != null)
       .slice(-LOSS_STREAK_COUNT);
 
     if (
       recent.length === LOSS_STREAK_COUNT &&
-      recent.every(t => (t.pnl as number) < 0) &&
+      recent.every(t => (closedTradeNetAmount(t) as number) < 0) &&
       Date.now() >= this.lossStreakPauseUntil
     ) {
       this.lossStreakPauseUntil = Date.now() + LOSS_STREAK_PAUSE_MS;

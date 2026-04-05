@@ -8,43 +8,43 @@ interface TradeFeedProps {
 export const TradeFeed: React.FC<TradeFeedProps> = ({ trades }) => {
   return (
     <div className="glass rounded-xl overflow-hidden">
-      <div className="p-4 md:p-6 border-b border-white/5">
+      <div className="p-3 sm:p-4 md:p-6 border-b border-white/5">
         <h3 className="text-xs md:text-sm font-bold uppercase tracking-widest">Trade Feed</h3>
       </div>
 
       {/* Mobile card view */}
-      <div className="md:hidden divide-y divide-white/5 overflow-y-auto max-h-[60vh]">
+      <div className="md:hidden divide-y divide-white/5 overflow-y-auto max-h-[min(70vh,28rem)] overscroll-contain">
         {trades.slice().reverse().map((trade) => (
-          <div key={trade.id} className="px-4 py-3 space-y-1.5">
-            <div className="flex justify-between items-center">
-              <span className="font-mono text-[10px] text-white/40">
+          <div key={trade.id} className="px-3 sm:px-4 py-3.5 space-y-2">
+            <div className="flex justify-between items-center gap-2">
+              <span className="font-mono text-[11px] text-white/50 tabular-nums">
                 {format(trade.timestamp, 'HH:mm:ss')}
               </span>
-              <span className={`text-[9px] uppercase tracking-widest ${trade.status === 'OPEN' ? 'text-white animate-pulse' : 'text-white/20'}`}>
+              <span className={`text-[10px] font-medium uppercase tracking-widest shrink-0 ${trade.status === 'OPEN' ? 'text-white animate-pulse' : 'text-white/25'}`}>
                 {trade.status}
               </span>
             </div>
-            <div className="flex justify-between items-center">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-medium">{trade.symbol}</span>
-                <span className={`px-1.5 py-0.5 rounded-sm text-[9px] font-bold uppercase ${trade.side === 'LONG' ? 'bg-white text-black' : 'bg-white/10 text-white'}`}>
+            <div className="flex justify-between items-center gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-sm font-medium truncate">{trade.symbol}</span>
+                <span className={`px-2 py-0.5 rounded-sm text-[10px] font-bold uppercase shrink-0 ${trade.side === 'LONG' ? 'bg-white text-black' : 'bg-white/10 text-white'}`}>
                   {trade.side}
                 </span>
               </div>
-              <span className={`font-mono text-xs ${typeof trade.pnl === 'number' && trade.pnl >= 0 ? 'text-white' : 'text-white/40'}`}>
+              <span className={`font-mono text-sm tabular-nums shrink-0 ${typeof trade.pnl === 'number' && trade.pnl >= 0 ? 'text-white' : 'text-white/40'}`}>
                 {trade.status === 'CLOSED' && typeof trade.pnl === 'number'
                   ? `${trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}`
                   : 'OPEN'}
               </span>
             </div>
-            <div className="flex gap-4 text-[10px] font-mono text-white/30">
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] font-mono text-white/35">
               <span>IN ${trade.entryPrice.toFixed(2)}</span>
               {trade.exitPrice && <span>OUT ${trade.exitPrice.toFixed(2)}</span>}
             </div>
           </div>
         ))}
         {trades.length === 0 && (
-          <div className="px-4 py-10 text-center text-white/20 text-[10px] uppercase tracking-widest">
+          <div className="px-4 py-12 text-center text-white/20 text-[11px] uppercase tracking-widest">
             No trades yet
           </div>
         )}
