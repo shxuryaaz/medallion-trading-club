@@ -12,6 +12,9 @@ export interface OHLCV {
 export class DataLayer {
   private static BASE_URL = 'https://api.binance.com/api/v3';
   private static bannedUntilMs = 0;
+  private static cachedTopCoins: string[] = [];
+  private static topCoinsCachedAt = 0;
+  private static TOP_COINS_TTL_MS = 30 * 60 * 1000; // refresh every 30 min
 
   static async fetchOHLCV(symbol: string, interval: string = '5m', limit: number = 100): Promise<OHLCV[]> {
     if (Date.now() < this.bannedUntilMs) {
@@ -102,6 +105,10 @@ export class DataLayer {
   }
 
   static async fetchTopCoins(limit: number = 10): Promise<string[]> {
+    const now = Date.now();
+    if (this.cachedTopCoins.length > 0 && now - this.topCoinsCachedAt < this.TOP_COINS_TTL_MS) {
+      return this.cachedTopCoins.slice(0, limit);
+    }
     try {
       const response = await axios.get(`${this.BASE_URL}/ticker/24hr`);
       const tickers = response.data
@@ -109,10 +116,14 @@ export class DataLayer {
         .sort((a: any, b: any) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
         .slice(0, limit)
         .map((t: any) => t.symbol);
+      this.cachedTopCoins = tickers;
+      this.topCoinsCachedAt = now;
       return tickers;
     } catch (error) {
       console.error('Error fetching top coins:', error);
-      return ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'];
+      return this.cachedTopCoins.length > 0
+        ? this.cachedTopCoins.slice(0, limit)
+        : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'];
     }
   }
 }
