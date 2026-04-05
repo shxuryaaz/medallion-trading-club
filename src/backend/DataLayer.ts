@@ -11,8 +11,14 @@ export interface OHLCV {
 
 export class DataLayer {
   private static BASE_URL = 'https://api.binance.com/api/v3';
+  private static bannedUntilMs = 0;
 
   static async fetchOHLCV(symbol: string, interval: string = '5m', limit: number = 100): Promise<OHLCV[]> {
+    if (Date.now() < this.bannedUntilMs) {
+      const secsLeft = Math.ceil((this.bannedUntilMs - Date.now()) / 1000);
+      console.log(`[DataLayer] Still banned. Skipping fetch. ${secsLeft}s remaining.`);
+      return [];
+    }
     try {
       const response = await axios.get(`${this.BASE_URL}/klines`, {
         params: {
@@ -33,8 +39,9 @@ export class DataLayer {
     } catch (error: any) {
       const status = error?.response?.status;
       if (status === 418 || status === 429) {
-        const retryAfter = error?.response?.headers?.['retry-after'];
-        console.error(`[DataLayer] Binance rate limit hit (${status}). Retry-After: ${retryAfter}s. Pausing fetches.`);
+        const retryAfter = parseInt(error?.response?.headers?.['retry-after'] ?? '60', 10);
+        this.bannedUntilMs = Date.now() + retryAfter * 1000;
+        console.error(`[DataLayer] Binance banned us (${status}). Pausing all fetches for ${retryAfter}s.`);
       } else {
         console.error(`Error fetching data for ${symbol}:`, error);
       }
