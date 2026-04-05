@@ -255,6 +255,7 @@ export class TradingSystem {
         }
       }
 
+      await new Promise((r) => setTimeout(r, 1000)); // 1s between coins to avoid rate limit
       const data = await DataLayer.fetchOHLCV(symbol, '15m', 100);
       if (data.length === 0) continue;
 

@@ -30,8 +30,14 @@ export class DataLayer {
         close: parseFloat(k[4]),
         volume: parseFloat(k[5])
       }));
-    } catch (error) {
-      console.error(`Error fetching data for ${symbol}:`, error);
+    } catch (error: any) {
+      const status = error?.response?.status;
+      if (status === 418 || status === 429) {
+        const retryAfter = error?.response?.headers?.['retry-after'];
+        console.error(`[DataLayer] Binance rate limit hit (${status}). Retry-After: ${retryAfter}s. Pausing fetches.`);
+      } else {
+        console.error(`Error fetching data for ${symbol}:`, error);
+      }
       return [];
     }
   }
