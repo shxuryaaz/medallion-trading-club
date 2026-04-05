@@ -181,15 +181,19 @@ function entryTimingGates(data: OHLCV[], side: 'LONG' | 'SHORT'): { ok: true } |
   const lastIdx = data.length - 1;
   const prevIdx = data.length - 2;
 
+  // 0.1% tolerance: allow entry when close is within 0.1% of the breakout level
+  // (accounts for crypto wicks and noise — avoids requiring textbook-perfect breakouts)
+  const brkPad = price * 0.001;
+
   if (side === 'LONG') {
-    if (!longBreakoutAtBar(data, lastIdx, 0)) {
+    if (!longBreakoutAtBar(data, lastIdx, -brkPad)) {
       return {
         ok: false,
         reason: 'long_close_not_above_prior_3_highs',
         skipCause: 'no_breakout',
       };
     }
-    if (!longBreakoutAtBar(data, prevIdx, 0)) {
+    if (!longBreakoutAtBar(data, prevIdx, -brkPad)) {
       return {
         ok: false,
         reason: 'long_breakout_not_sustained_prev_candle',
@@ -197,14 +201,14 @@ function entryTimingGates(data: OHLCV[], side: 'LONG' | 'SHORT'): { ok: true } |
       };
     }
   } else {
-    if (!shortBreakoutAtBar(data, lastIdx, 0)) {
+    if (!shortBreakoutAtBar(data, lastIdx, -brkPad)) {
       return {
         ok: false,
         reason: 'short_close_not_below_prior_3_lows',
         skipCause: 'no_breakout',
       };
     }
-    if (!shortBreakoutAtBar(data, prevIdx, 0)) {
+    if (!shortBreakoutAtBar(data, prevIdx, -brkPad)) {
       return {
         ok: false,
         reason: 'short_breakout_not_sustained_prev_candle',
