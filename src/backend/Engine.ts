@@ -552,6 +552,7 @@ export interface Position {
   takeProfit: number;
   timestamp: number;
   initialStopDist: number; // ATR-based stop distance at entry, used for trailing stop logic
+  engineId?: string; // 'swing' | 'scalp' — which engine owns this position
 }
 
 export class RiskAgent {

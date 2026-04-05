@@ -11,16 +11,18 @@ import {
 } from './Engine';
 import type { TradeLog } from './types';
 import { StateStore } from './persistence/StateStore';
+import { PortfolioManager } from './portfolio/PortfolioManager';
 
 export type { TradeLog } from './types';
 
+const ENGINE_ID = 'swing';
+
 const MAX_OPEN_TRADES = 2;
-const MAX_PORTFOLIO_RISK_FRAC = 0.02;
 /** Global cooldown after any new open. */
 const TRADE_COOLDOWN_MS = 5 * 60 * 1000;
 /** After closing a symbol, block re-entry on that symbol. */
 const SYMBOL_REENTRY_COOLDOWN_MS = 30 * 60 * 1000;
-/** After 3 consecutive closed losses, pause new entries (BTC stability). */
+/** After 3 consecutive closed losses, pause new entries. */
 const LOSS_STREAK_PAUSE_MS = 60 * 60 * 1000;
 
 function truncate(s: string, max: number): string {
@@ -63,12 +65,15 @@ function normalizeLoadedPosition(p: Partial<Position> & Record<string, unknown>)
     stopLoss: typeof p.stopLoss === 'number' ? p.stopLoss : entry,
     takeProfit: typeof p.takeProfit === 'number' ? p.takeProfit : entry,
     timestamp: typeof p.timestamp === 'number' ? p.timestamp : Date.now(),
-    initialStopDist: typeof p.initialStopDist === 'number' ? p.initialStopDist : Math.abs(entry - (typeof p.stopLoss === 'number' ? p.stopLoss : entry)),
+    initialStopDist: typeof p.initialStopDist === 'number'
+      ? p.initialStopDist
+      : Math.abs(entry - (typeof p.stopLoss === 'number' ? p.stopLoss : entry)),
+    engineId: ENGINE_ID,
   };
 }
 
 export class TradingSystem {
-  private balance: number = 10000;
+  private readonly portfolio: PortfolioManager;
   private activePositions: Position[] = [];
   private tradeHistory: TradeLog[] = [];
   private isRunning: boolean = false;
@@ -77,14 +82,17 @@ export class TradingSystem {
   private symbolLastClosedAt = new Map<string, number>();
   private lossStreakPauseUntil = 0;
 
-  constructor() {
-    const snap = StateStore.load();
+  constructor(portfolio: PortfolioManager) {
+    this.portfolio = portfolio;
+
+    const snap = StateStore.load(ENGINE_ID);
     if (snap) {
-      this.balance = snap.balance;
       this.tradeHistory = snap.tradeHistory;
       this.activePositions = snap.activePositions
         .map((p) => normalizeLoadedPosition(p as Partial<Position> & Record<string, unknown>))
         .filter((p): p is Position => p !== null);
+
+      // Reconcile tradeIds between positions and trade history
       for (const t of this.tradeHistory) {
         if (t.status !== 'OPEN') continue;
         const pos = this.activePositions.find(
@@ -103,23 +111,27 @@ export class TradingSystem {
         );
         if (t) pos.tradeId = t.id;
       }
+
+      // Drop positions that have no matching OPEN trade
       const before = this.activePositions.length;
       this.activePositions = this.activePositions.filter((pos) => {
         const ok =
           Boolean(pos.tradeId) &&
           this.tradeHistory.some((t) => t.id === pos.tradeId && t.status === 'OPEN');
         if (!ok) {
-          console.error(
-            '[TradingSystem] dropped position without matching OPEN trade:',
-            pos.symbol,
-            pos.tradeId
-          );
+          console.error('[TradingSystem] dropped orphan position:', pos.symbol, pos.tradeId);
         }
         return ok;
       });
       if (this.activePositions.length < before) {
-        console.error('[TradingSystem] removed', before - this.activePositions.length, 'orphan position(s) on load');
+        console.error('[TradingSystem] removed', before - this.activePositions.length, 'orphan(s) on load');
       }
+
+      // Re-register surviving positions in the shared portfolio risk registry
+      for (const pos of this.activePositions) {
+        this.portfolio.registerTrade(ENGINE_ID, pos.tradeId, pos.symbol, riskAtStop(pos));
+      }
+
       if (
         typeof snap.lossStreakPauseUntil === 'number' &&
         Number.isFinite(snap.lossStreakPauseUntil) &&
@@ -128,12 +140,11 @@ export class TradingSystem {
         this.lossStreakPauseUntil = snap.lossStreakPauseUntil;
       }
     }
-    this.addLog('System initialized. Medallion Club ready.');
+    this.addLog('Swing engine initialized. Medallion Club ready.');
   }
 
   private persistState() {
-    StateStore.save({
-      balance: this.balance,
+    StateStore.save(ENGINE_ID, {
       tradeHistory: this.tradeHistory,
       activePositions: this.activePositions,
       lossStreakPauseUntil:
@@ -155,7 +166,7 @@ export class TradingSystem {
         ? (currentPrice - pos.entryPrice) * pos.amount
         : (pos.entryPrice - currentPrice) * pos.amount;
 
-    // Trailing stop logic
+    // Trailing stop logic (unchanged)
     const stopDist = pos.initialStopDist ?? Math.abs(pos.entryPrice - pos.stopLoss);
     const profitDist =
       pos.side === 'LONG'
@@ -163,7 +174,6 @@ export class TradingSystem {
         : pos.entryPrice - currentPrice;
 
     if (profitDist >= 1.5 * stopDist) {
-      // Move stop to breakeven once 75% of TP distance reached
       if (pos.side === 'LONG') {
         pos.stopLoss = Math.max(pos.stopLoss, pos.entryPrice);
       } else {
@@ -171,7 +181,6 @@ export class TradingSystem {
       }
     }
     if (profitDist >= 2 * stopDist) {
-      // Trail stop 1 ATR behind current price
       const trailingStop =
         pos.side === 'LONG' ? currentPrice - stopDist : currentPrice + stopDist;
       if (pos.side === 'LONG') {
@@ -209,14 +218,7 @@ export class TradingSystem {
     const avgProfit = wins.length > 0 ? wins.reduce((s, t) => s + (t.pnl as number), 0) / wins.length : 0;
     const avgLoss =
       losses.length > 0 ? losses.reduce((s, t) => s + (t.pnl as number), 0) / losses.length : 0;
-    return {
-      closedTrades: n,
-      wins: wins.length,
-      losses: losses.length,
-      winRate,
-      avgProfit,
-      avgLoss,
-    };
+    return { closedTrades: n, wins: wins.length, losses: losses.length, winRate, avgProfit, avgLoss };
   }
 
   async refreshOpenPositionMarks(): Promise<void> {
@@ -230,13 +232,13 @@ export class TradingSystem {
   async start() {
     if (this.isRunning) return;
     this.isRunning = true;
-    this.addLog('Trading system started.');
+    this.addLog('Swing engine started.');
     this.runMainLoop();
   }
 
   stop() {
     this.isRunning = false;
-    this.addLog('Trading system stopped.');
+    this.addLog('Swing engine stopped.');
   }
 
   private async runMainLoop() {
@@ -256,7 +258,7 @@ export class TradingSystem {
 
     if (Date.now() < this.lossStreakPauseUntil) {
       const secLeft = Math.ceil((this.lossStreakPauseUntil - Date.now()) / 1000);
-      this.addLog(`SKIP scan cause=loss_streak_pause ~${secLeft}s remaining (after 3 consecutive losses)`);
+      this.addLog(`SKIP scan cause=loss_streak_pause ~${secLeft}s remaining`);
       return;
     }
 
@@ -282,7 +284,7 @@ export class TradingSystem {
         }
       }
 
-      await new Promise((r) => setTimeout(r, 1000)); // 1s between coins to avoid rate limit
+      await new Promise((r) => setTimeout(r, 1000));
       const data = await DataLayer.fetchOHLCV(symbol, '15m', 100);
       if (data.length === 0) continue;
 
@@ -325,47 +327,49 @@ export class TradingSystem {
     ohlcv: OHLCV[],
     market: ReturnType<typeof analyzeMarketForTrading>
   ) {
+    // Per-engine position cap (swing only)
     if (this.activePositions.length >= MAX_OPEN_TRADES) {
       this.addLog(`SKIP ${symbol} ${side} cause=max_positions (${MAX_OPEN_TRADES})`);
       return;
     }
 
-    const usedRisk = this.activePositions.reduce((sum, p) => sum + riskAtStop(p), 0);
-    const cap = this.balance * MAX_PORTFOLIO_RISK_FRAC;
-    const room = cap - usedRisk;
-    if (room <= 0) {
+    // Compute intended risk; portfolio gate enforces cross-engine limits
+    const balance     = this.portfolio.getBalance();
+    const targetRisk  = balance * RISK_PER_TRADE;
+    const lowAtr      = market.atrPct > 0 && market.atrPct < LOW_ATR_HALVE_RISK_PCT;
+    const riskScale   = lowAtr ? 0.5 : 1;
+    const requestedRisk = targetRisk * riskScale;
+
+    if (lowAtr) {
       this.addLog(
-        `SKIP ${symbol} ${side} cause=portfolio_risk_cap (${MAX_PORTFOLIO_RISK_FRAC * 100}% of balance)`
+        `RISK ${symbol} low_atr atrPct=${(market.atrPct * 100).toFixed(5)} → half size`
       );
+    }
+
+    // Portfolio gate: checks symbol risk cap + global risk cap
+    const allocation = this.portfolio.requestCapital(ENGINE_ID, symbol, requestedRisk);
+    if (!allocation.approved) {
+      this.addLog(`SKIP ${symbol} ${side} cause=${allocation.reason}`);
       return;
     }
 
-    const targetRisk = this.balance * RISK_PER_TRADE;
-    const lowAtr =
-      market.atrPct > 0 &&
-      market.atrPct < LOW_ATR_HALVE_RISK_PCT;
-    const riskScale = lowAtr ? 0.5 : 1;
-    const riskDollars = Math.min(targetRisk * riskScale, room);
+    const riskDollars = allocation.riskAllocated;
     if (riskDollars <= 0 || !Number.isFinite(riskDollars)) {
       this.addLog(`SKIP ${symbol} ${side} cause=invalid_risk_budget`);
       return;
     }
 
-    if (lowAtr) {
-      this.addLog(
-        `RISK ${symbol} low_atr atrPct=${(market.atrPct * 100).toFixed(5)} → half size (risk$=${riskDollars.toFixed(2)})`
-      );
-    }
-
-    const position = RiskAgent.calculatePosition(this.balance, price, side, ohlcv, riskDollars);
+    const position = RiskAgent.calculatePosition(balance, price, side, ohlcv, riskDollars);
     if (!position) {
       this.addLog(`SKIP ${symbol} ${side} cause=risk_sizing_failed`);
       return;
     }
 
     const tradeId = randomUUID();
-    position.tradeId = tradeId;
-    position.symbol = symbol;
+    position.tradeId  = tradeId;
+    position.symbol   = symbol;
+    position.engineId = ENGINE_ID;
+
     this.activePositions.push(position);
 
     const trade: TradeLog = {
@@ -376,12 +380,16 @@ export class TradingSystem {
       amount: position.amount,
       status: 'OPEN',
       timestamp: Date.now(),
+      source: 'swing',
     };
     this.tradeHistory.push(trade);
 
+    // Register risk with portfolio — synchronous, immediately after push
+    this.portfolio.registerTrade(ENGINE_ID, tradeId, symbol, riskAtStop(position));
+
     this.persistState();
     this.lastTradeOpenedAt = Date.now();
-    this.addLog(`Executed ${side} on ${symbol} at ${price} (tradeId=${tradeId})`);
+    this.addLog(`OPEN ${side} ${symbol} @ ${price} (tradeId=${tradeId})`);
   }
 
   private async monitorPositions() {
@@ -395,23 +403,11 @@ export class TradingSystem {
       let reason = '';
 
       if (pos.side === 'LONG') {
-        if (currentPrice <= pos.stopLoss) {
-          shouldClose = true;
-          reason = 'Stop Loss';
-        }
-        if (currentPrice >= pos.takeProfit) {
-          shouldClose = true;
-          reason = 'Take Profit';
-        }
+        if (currentPrice <= pos.stopLoss)  { shouldClose = true; reason = 'Stop Loss'; }
+        if (currentPrice >= pos.takeProfit) { shouldClose = true; reason = 'Take Profit'; }
       } else {
-        if (currentPrice >= pos.stopLoss) {
-          shouldClose = true;
-          reason = 'Stop Loss';
-        }
-        if (currentPrice <= pos.takeProfit) {
-          shouldClose = true;
-          reason = 'Take Profit';
-        }
+        if (currentPrice >= pos.stopLoss)  { shouldClose = true; reason = 'Stop Loss'; }
+        if (currentPrice <= pos.takeProfit) { shouldClose = true; reason = 'Take Profit'; }
       }
 
       if (shouldClose) {
@@ -423,17 +419,13 @@ export class TradingSystem {
   private closePosition(index: number, price: number, reason: string) {
     const pos = this.activePositions[index];
     if (!pos.tradeId) {
-      this.addLog(
-        `ERROR closePosition: missing tradeId for symbol=${pos.symbol}; position not removed`
-      );
+      this.addLog(`ERROR closePosition: missing tradeId for symbol=${pos.symbol}`);
       return;
     }
 
     const trade = this.tradeHistory.find((t) => t.id === pos.tradeId && t.status === 'OPEN');
     if (!trade) {
-      this.addLog(
-        `ERROR closePosition: no OPEN trade for tradeId=${pos.tradeId} symbol=${pos.symbol}; position not removed`
-      );
+      this.addLog(`ERROR closePosition: no OPEN trade for tradeId=${pos.tradeId}`);
       return;
     }
 
@@ -442,17 +434,20 @@ export class TradingSystem {
         ? (price - pos.entryPrice) * pos.amount
         : (pos.entryPrice - price) * pos.amount;
 
-    this.balance += pnl;
-    trade.exitPrice = price;
-    trade.pnl = pnl;
-    trade.status = 'CLOSED';
+    // Portfolio: credit PnL to shared balance + remove from risk registry
+    this.portfolio.closeTrade(pos.tradeId, pnl);
+
+    trade.exitPrice     = price;
+    trade.pnl           = pnl;
+    trade.status        = 'CLOSED';
     trade.exitTimestamp = Date.now();
 
-    this.addLog(`Closed ${pos.symbol} at ${price} (${reason}). PnL: ${pnl.toFixed(2)}`);
+    this.addLog(`CLOSE ${pos.symbol} @ ${price} (${reason}). PnL: ${pnl.toFixed(2)}`);
 
     this.symbolLastClosedAt.set(pos.symbol, Date.now());
     this.activePositions.splice(index, 1);
 
+    // Loss streak check (swing-specific — 3 consecutive losses)
     const closed = this.tradeHistory.filter(
       (t) => t.status === 'CLOSED' && typeof t.pnl === 'number'
     );
@@ -463,9 +458,7 @@ export class TradingSystem {
       Date.now() >= this.lossStreakPauseUntil
     ) {
       this.lossStreakPauseUntil = Date.now() + LOSS_STREAK_PAUSE_MS;
-      this.addLog(
-        'PAUSE new entries 1h (loss_streak_pause) after 3 consecutive losing closes'
-      );
+      this.addLog('PAUSE new entries 1h (loss_streak) after 3 consecutive losses');
     }
 
     this.persistState();
@@ -474,12 +467,10 @@ export class TradingSystem {
   getStatus() {
     return {
       isRunning: this.isRunning,
-      balance: this.balance,
+      balance: this.portfolio.getBalance(),
       activePositions: this.activePositions,
       tradeHistory: this.tradeHistory,
       logs: this.logs,
     };
   }
 }
-
-export const tradingSystem = new TradingSystem();

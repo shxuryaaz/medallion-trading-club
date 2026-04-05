@@ -7,6 +7,7 @@ import { LiveChart } from "./components/dashboard/LiveChart";
 import { AgentInsights } from "./components/dashboard/AgentInsights";
 import { TradeFeed } from "./components/dashboard/TradeFeed";
 import { SystemStatus } from "./components/dashboard/SystemStatus";
+import { ScalpDashboard, type ScalpSnapshot } from "./components/dashboard/ScalpDashboard";
 import { Shield, Settings, LogOut, Bell, Activity } from "lucide-react";
 
 const SYMBOL_OPTIONS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"] as const;
@@ -18,6 +19,8 @@ export default function App() {
   const [selectedSymbol, setSelectedSymbol] = useState<string>("BTCUSDT");
   const [loading, setLoading] = useState(true);
   const [activeView, setActiveView] = useState<"dashboard" | "settings" | "activity">("dashboard");
+  const [scalpSnapshot, setScalpSnapshot] = useState<ScalpSnapshot | null>(null);
+  const [scalpPerformance, setScalpPerformance] = useState<any>(null);
 
   const fetchStatus = async () => {
     try {
@@ -46,9 +49,22 @@ export default function App() {
     }
   };
 
+  const fetchScalpDashboard = async () => {
+    try {
+      const [snapRes, perfRes] = await Promise.all([
+        axios.get<ScalpSnapshot>(`${API_BASE_URL}/api/scalp/status?symbol=${selectedSymbol}`),
+        axios.get(`${API_BASE_URL}/api/performance`),
+      ]);
+      setScalpSnapshot(snapRes.data);
+      setScalpPerformance(perfRes.data?.scalp ?? null);
+    } catch (err) {
+      console.error("Error fetching scalp dashboard:", err);
+    }
+  };
+
   useEffect(() => {
     const init = async () => {
-      await Promise.all([fetchStatus(), fetchOhlcv(), fetchInsights()]);
+      await Promise.all([fetchStatus(), fetchOhlcv(), fetchInsights(), fetchScalpDashboard()]);
       setLoading(false);
     };
     init();
@@ -57,6 +73,7 @@ export default function App() {
       fetchStatus();
       fetchOhlcv();
       fetchInsights();
+      fetchScalpDashboard();
     }, 5000);
 
     return () => clearInterval(interval);
@@ -215,6 +232,13 @@ export default function App() {
                   <AgentInsights insights={insights} symbol={selectedSymbol} />
                 </div>
               </div>
+
+              <ScalpDashboard
+                snapshot={scalpSnapshot}
+                performance={scalpPerformance}
+                trades={safeStatus.tradeHistory}
+                positions={safeStatus.activePositions}
+              />
 
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-8">
                 <div className="lg:col-span-2">

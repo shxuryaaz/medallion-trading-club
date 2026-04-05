@@ -4,7 +4,10 @@ import cors from 'cors';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { tradingSystem } from './src/backend/TradingSystem.ts';
+import { PortfolioManager } from './src/backend/portfolio/PortfolioManager.ts';
+import { TradingSystem } from './src/backend/TradingSystem.ts';
+import { ScalpingEngine } from './src/backend/scalping/ScalpingEngine.ts';
+import { WebSocketManager } from './src/backend/data/WebSocketManager.ts';
 import { DataLayer } from './src/backend/DataLayer.ts';
 import { ScoringEngine } from './src/backend/Engine.ts';
 import { runBacktest } from './src/backend/backtest/BacktestRunner.ts';
@@ -19,29 +22,75 @@ async function startServer() {
   app.use(cors());
   app.use(express.json());
 
+  // ── Engine setup ────────────────────────────────────────────────────────────
+  const portfolio   = new PortfolioManager();
+  const wsManager   = WebSocketManager.getInstance();
+  const swingEngine = new TradingSystem(portfolio);
+  const scalpEngine = new ScalpingEngine(portfolio, wsManager);
+
+  // ── Routes ──────────────────────────────────────────────────────────────────
+
   app.get('/ping', (req, res) => {
     const now = new Date().toISOString();
     console.log(`[PING] UptimeRobot hit at ${now}`);
     res.json({ status: 'ok', time: now });
   });
 
-  // API Routes
+  /**
+   * Aggregated status from all engines.
+   * Positions and history are merged and sorted newest-first for the frontend.
+   * Per-engine breakdown is also included for future UI panels.
+   */
   app.get('/api/status', async (req, res) => {
-    try {
-      await tradingSystem.refreshOpenPositionMarks();
-    } catch (e) {
-      console.error('[api/status] refreshOpenPositionMarks:', e);
+    // Refresh swing marks via REST (as before); scalp uses WS prices in-memory
+    try { await swingEngine.refreshOpenPositionMarks(); } catch (e) {
+      console.error('[api/status] swing refresh:', e);
     }
-    res.json(tradingSystem.getStatus());
+    try { await scalpEngine.refreshOpenPositionMarks(); } catch (e) {
+      console.error('[api/status] scalp refresh:', e);
+    }
+
+    const swingStatus = swingEngine.getStatus();
+    const scalpStatus = scalpEngine.getStatus();
+
+    const allPositions = [
+      ...swingStatus.activePositions,
+      ...scalpStatus.activePositions,
+    ];
+    const allHistory = [
+      ...swingStatus.tradeHistory,
+      ...scalpStatus.tradeHistory,
+    ].sort((a, b) => b.timestamp - a.timestamp);
+    const allLogs = [
+      ...swingStatus.logs,
+      ...scalpStatus.logs,
+    ].sort(); // logs include timestamps in the string — sort brings them into order
+
+    res.json({
+      // Top-level fields the frontend already consumes (unchanged shape)
+      isRunning:       swingStatus.isRunning || scalpStatus.isRunning,
+      balance:         portfolio.getBalance(),
+      activePositions: allPositions,
+      tradeHistory:    allHistory,
+      logs:            allLogs,
+      // Per-engine breakdown (new — available for future UI tabs)
+      engines: {
+        swing: swingStatus,
+        scalp: scalpStatus,
+      },
+      riskSummary: portfolio.getRiskSummary(),
+    });
   });
 
   app.post('/api/start', async (req, res) => {
-    await tradingSystem.start();
+    await swingEngine.start();
+    await scalpEngine.start();
     res.json({ status: 'started' });
   });
 
   app.post('/api/stop', (req, res) => {
-    tradingSystem.stop();
+    swingEngine.stop();
+    scalpEngine.stop();
     res.json({ status: 'stopped' });
   });
 
@@ -60,8 +109,35 @@ async function startServer() {
     res.json(insights);
   });
 
+  app.get('/api/scalp/status', async (req, res) => {
+    const symbol =
+      typeof req.query.symbol === 'string' && req.query.symbol.length > 0
+        ? req.query.symbol.toUpperCase()
+        : 'BTCUSDT';
+    try {
+      const snapshot = await scalpEngine.getDashboardSnapshot(symbol);
+      res.json(snapshot);
+    } catch (e) {
+      console.error('[api/scalp/status]', e);
+      res.status(500).json({ error: String(e) });
+    }
+  });
+
   app.get('/api/performance', (req, res) => {
-    res.json(tradingSystem.getPerformanceStats());
+    const swingStats = swingEngine.getPerformanceStats();
+    const scalpStats = scalpEngine.getPerformanceStats();
+
+    // Combined across both engines
+    const combined = {
+      closedTrades: swingStats.closedTrades + scalpStats.closedTrades,
+      wins:         swingStats.wins  + scalpStats.wins,
+      losses:       swingStats.losses + scalpStats.losses,
+      winRate: (swingStats.closedTrades + scalpStats.closedTrades) > 0
+        ? (swingStats.wins + scalpStats.wins) / (swingStats.closedTrades + scalpStats.closedTrades)
+        : 0,
+    };
+
+    res.json({ combined, swing: swingStats, scalp: scalpStats });
   });
 
   app.post('/api/backtest', async (req, res) => {
@@ -76,21 +152,9 @@ async function startServer() {
           ? body.initialBalance
           : undefined;
 
-      const result = await runBacktest({
-        symbol,
-        interval,
-        days,
-        useAI,
-        initialBalance,
-      });
-
+      const result = await runBacktest({ symbol, interval, days, useAI, initialBalance });
       const { logs, trades, ...summary } = result;
-      res.json({
-        ...summary,
-        trades,
-        logLineCount: logs.length,
-        logsPreview: logs.slice(-200),
-      });
+      res.json({ ...summary, trades, logLineCount: logs.length, logsPreview: logs.slice(-200) });
     } catch (e) {
       console.error('[api/backtest]', e);
       res.status(500).json({ error: String(e) });
@@ -100,10 +164,7 @@ async function startServer() {
   // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { 
-        middlewareMode: true,
-        hmr: false 
-      },
+      server: { middlewareMode: true, hmr: false },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -117,9 +178,12 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Medallion Club Server running on http://localhost:${PORT}`);
-    void tradingSystem.start().catch((e) => {
-      console.error('[server] tradingSystem.start failed:', e);
-    });
+
+    // Both engines start fire-and-forget — they never block each other.
+    // Swing: async while loop, 5-min cadence
+    // Scalp: recursive setTimeout, 4-second cadence + WS bootstrap
+    void swingEngine.start().catch((e) => console.error('[server] swing start failed:', e));
+    void scalpEngine.start().catch((e) => console.error('[server] scalp start failed:', e));
   });
 }
 
