@@ -255,7 +255,7 @@ export class TradingSystem {
         }
       }
 
-      const data = await DataLayer.fetchOHLCV(symbol);
+      const data = await DataLayer.fetchOHLCV(symbol, '15m', 100);
       if (data.length === 0) continue;
 
       const market = analyzeMarketForTrading(data);

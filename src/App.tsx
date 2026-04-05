@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import axios from "axios";
+import { API_BASE_URL } from "./config";
 import { motion, AnimatePresence } from "motion/react";
 import { PortfolioOverview } from "./components/dashboard/PortfolioOverview";
 import { LiveChart } from "./components/dashboard/LiveChart";
@@ -20,7 +21,7 @@ export default function App() {
 
   const fetchStatus = async () => {
     try {
-      const res = await axios.get("/api/status");
+      const res = await axios.get(`${API_BASE_URL}/api/status`);
       setStatus(res.data);
     } catch (err) {
       console.error("Error fetching status:", err);
@@ -29,7 +30,7 @@ export default function App() {
 
   const fetchOhlcv = async () => {
     try {
-      const res = await axios.get(`/api/ohlcv/${selectedSymbol}`);
+      const res = await axios.get(`${API_BASE_URL}/api/ohlcv/${selectedSymbol}`);
       setOhlcv(res.data);
     } catch (err) {
       console.error("Error fetching OHLCV:", err);
@@ -38,7 +39,7 @@ export default function App() {
 
   const fetchInsights = async () => {
     try {
-      const res = await axios.get(`/api/insights/${selectedSymbol}`);
+      const res = await axios.get(`${API_BASE_URL}/api/insights/${selectedSymbol}`);
       setInsights(res.data);
     } catch (err) {
       console.error("Error fetching insights:", err);
@@ -62,13 +63,21 @@ export default function App() {
   }, [selectedSymbol]);
 
   const handleStart = async () => {
-    await axios.post("/api/start");
-    fetchStatus();
+    try {
+      await axios.post(`${API_BASE_URL}/api/start`);
+      fetchStatus();
+    } catch (err) {
+      console.error("Error starting trading system:", err);
+    }
   };
 
   const handleStop = async () => {
-    await axios.post("/api/stop");
-    fetchStatus();
+    try {
+      await axios.post(`${API_BASE_URL}/api/stop`);
+      fetchStatus();
+    } catch (err) {
+      console.error("Error stopping trading system:", err);
+    }
   };
 
   const safeStatus = status ?? {
@@ -201,15 +210,15 @@ export default function App() {
 
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
                 <div className="lg:col-span-2">
-                  <TradeFeed trades={safeStatus.tradeHistory} />
-                </div>
-                <div>
                   <SystemStatus 
                     isRunning={safeStatus.isRunning} 
                     logs={safeStatus.logs} 
                     onStart={handleStart} 
                     onStop={handleStop} 
                   />
+                </div>
+                <div>
+                  <TradeFeed trades={safeStatus.tradeHistory} />
                 </div>
               </div>
             </motion.div>

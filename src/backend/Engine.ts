@@ -50,10 +50,10 @@ export const LOW_ATR_HALVE_RISK_PCT = 0.00032;
 const SCORE_NEUTRAL_LOW = 35;
 const SCORE_NEUTRAL_HIGH = 65;
 
-/** Strong long only if score > this (weak long is (65, 72]). */
-const SCORE_STRONG_LONG_MIN = 72;
-/** Strong short only if score < this (weak short is [28, 35)). */
-const SCORE_STRONG_SHORT_MAX = 28;
+/** Strong long only if score > this (weak long is (65, 68]). */
+const SCORE_STRONG_LONG_MIN = 68;
+/** Strong short only if score < this (weak short is [32, 35)). */
+const SCORE_STRONG_SHORT_MAX = 32;
 
 type EntryScoreClass =
   | { kind: 'neutral' }
@@ -79,9 +79,8 @@ function classifyEntryScore(finalScore: number): EntryScoreClass {
 
 const OVEREXTENDED_ATR_MULT = 2.0;
 const BREAKOUT_LOOKBACK = 3;
-const BREAKOUT_ATR_PAD_MULT = 0.35;
-const RSI_LONG_MIN = 58;
-const RSI_SHORT_MAX = 42;
+const RSI_LONG_MIN = 55;
+const RSI_SHORT_MAX = 45;
 
 type EntryTimingFail = {
   ok: false;
@@ -92,7 +91,8 @@ type EntryTimingFail = {
     | 'no_breakout'
     | 'overextended_move'
     | 'weak_trend_persistence'
-    | 'breakout_not_sustained';
+    | 'breakout_not_sustained'
+    | 'weak_candle_close';
 };
 
 function longBreakoutAtBar(data: OHLCV[], barIndex: number, pad: number): boolean {
@@ -178,20 +178,18 @@ function entryTimingGates(data: OHLCV[], side: 'LONG' | 'SHORT'): { ok: true } |
   }
 
   const atr = computeATR(data);
-  const breakoutPad = atr != null && atr > 0 ? BREAKOUT_ATR_PAD_MULT * atr : 0;
-
   const lastIdx = data.length - 1;
   const prevIdx = data.length - 2;
 
   if (side === 'LONG') {
-    if (!longBreakoutAtBar(data, lastIdx, breakoutPad)) {
+    if (!longBreakoutAtBar(data, lastIdx, 0)) {
       return {
         ok: false,
-        reason: 'long_close_not_above_prior_3_highs_plus_atr_pad',
+        reason: 'long_close_not_above_prior_3_highs',
         skipCause: 'no_breakout',
       };
     }
-    if (!longBreakoutAtBar(data, prevIdx, breakoutPad)) {
+    if (!longBreakoutAtBar(data, prevIdx, 0)) {
       return {
         ok: false,
         reason: 'long_breakout_not_sustained_prev_candle',
@@ -199,14 +197,14 @@ function entryTimingGates(data: OHLCV[], side: 'LONG' | 'SHORT'): { ok: true } |
       };
     }
   } else {
-    if (!shortBreakoutAtBar(data, lastIdx, breakoutPad)) {
+    if (!shortBreakoutAtBar(data, lastIdx, 0)) {
       return {
         ok: false,
-        reason: 'short_close_not_below_prior_3_lows_minus_atr_pad',
+        reason: 'short_close_not_below_prior_3_lows',
         skipCause: 'no_breakout',
       };
     }
-    if (!shortBreakoutAtBar(data, prevIdx, breakoutPad)) {
+    if (!shortBreakoutAtBar(data, prevIdx, 0)) {
       return {
         ok: false,
         reason: 'short_breakout_not_sustained_prev_candle',
@@ -254,6 +252,16 @@ function entryTimingGates(data: OHLCV[], side: 'LONG' | 'SHORT'): { ok: true } |
     }
   }
 
+  const cur = data[data.length - 1];
+  const candleRange = cur.high - cur.low;
+  if (side === 'LONG') {
+    if (cur.close < cur.low + 0.7 * candleRange) {
+      return { ok: false, reason: 'weak_candle_close', skipCause: 'weak_candle_close' };
+    }
+  } else if (cur.close > cur.low + 0.3 * candleRange) {
+    return { ok: false, reason: 'weak_candle_close', skipCause: 'weak_candle_close' };
+  }
+
   const rsi = MomentumAgent.rsiSeries(closes, 14);
   if (rsi.length < 2) {
     return { ok: false, reason: 'rsi_insufficient', skipCause: 'entry_timing' };
@@ -265,7 +273,7 @@ function entryTimingGates(data: OHLCV[], side: 'LONG' | 'SHORT'): { ok: true } |
     if (rNow <= RSI_LONG_MIN || rNow <= rPrev) {
       return {
         ok: false,
-        reason: 'long_rsi_not_above_58_or_not_rising',
+        reason: 'long_rsi_not_above_55_or_not_rising',
         skipCause: 'entry_timing',
       };
     }
@@ -273,7 +281,7 @@ function entryTimingGates(data: OHLCV[], side: 'LONG' | 'SHORT'): { ok: true } |
     if (rNow >= RSI_SHORT_MAX || rNow >= rPrev) {
       return {
         ok: false,
-        reason: 'short_rsi_not_below_42_or_not_falling',
+        reason: 'short_rsi_not_below_45_or_not_falling',
         skipCause: 'entry_timing',
       };
     }

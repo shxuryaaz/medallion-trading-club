@@ -11,8 +11,8 @@ export const TradeFeed: React.FC<TradeFeedProps> = ({ trades }) => {
       <div className="p-6 border-b border-white/5">
         <h3 className="text-sm font-bold uppercase tracking-widest">Trade Execution Feed</h3>
       </div>
-      <div className="overflow-x-auto">
-        <table className="w-full text-left text-sm">
+      <div className="overflow-x-auto overflow-y-auto max-h-[min(75vh,52rem)]">
+        <table className="w-full text-left text-xs lg:text-sm">
           <thead>
             <tr className="text-[10px] uppercase tracking-widest text-white/40 border-b border-white/5">
               <th className="px-6 py-4 font-medium">Time</th>

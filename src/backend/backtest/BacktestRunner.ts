@@ -80,7 +80,7 @@ function buildEnrichment(
 
 export async function runBacktest(params: BacktestParams): Promise<BacktestResult> {
   const sym = params.symbol.toUpperCase();
-  const days = Math.min(30, Math.max(7, Math.floor(params.days)));
+  const days = Math.min(365, Math.max(1, Math.floor(params.days)));
   const initialBalance = params.initialBalance ?? DEFAULT_INITIAL;
   const endMs = Date.now();
   const startMs = endMs - days * 24 * 60 * 60 * 1000;
@@ -258,7 +258,7 @@ export async function runBacktest(params: BacktestParams): Promise<BacktestResul
     if (!evaluation.execute || !evaluation.side) {
       if (evaluation.skipCause === 'score_neutral') {
         log(
-          `[BT SKIP] bar=${t} cause=score_neutral score=${evaluation.finalScore.toFixed(1)} (neutral 35–65; strong need >72 long or <28 short)`
+          `[BT SKIP] bar=${t} cause=score_neutral score=${evaluation.finalScore.toFixed(1)} (neutral 35–65; strong need >68 long or <32 short)`
         );
       } else {
         log(

@@ -25,15 +25,15 @@ export const SystemStatus: React.FC<SystemStatusProps> = ({ isRunning, logs, onS
         </button>
       </div>
 
-      <div className="flex-1 bg-black/40 rounded-lg p-4 font-mono text-[10px] leading-relaxed overflow-y-auto max-h-[300px] border border-white/5">
-        <div className="flex items-center gap-2 text-white/40 mb-4 pb-2 border-b border-white/5">
-          <Terminal className="w-3 h-3" />
+      <div className="flex-1 bg-black/40 rounded-lg p-5 font-mono text-sm leading-relaxed overflow-y-auto min-h-[28rem] max-h-[min(75vh,52rem)] border border-white/5">
+        <div className="flex items-center gap-2 text-white/50 mb-4 pb-2 border-b border-white/5 text-xs uppercase tracking-widest">
+          <Terminal className="w-4 h-4" />
           <span>MEDALLION_CLUB_LOGS</span>
         </div>
-        <div className="space-y-1">
+        <div className="space-y-1.5">
           {logs.slice().reverse().map((log, i) => (
-            <div key={i} className="text-white/60">
-              <span className="text-white/20 mr-2">{'>'}</span>
+            <div key={i} className="text-white/70">
+              <span className="text-white/25 mr-2">{'>'}</span>
               {log}
             </div>
           ))}

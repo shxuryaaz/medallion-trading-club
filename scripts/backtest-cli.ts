@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { runBacktest } from '../src/backend/backtest/BacktestRunner.ts';
 
 const symbol = process.argv[2] || 'BTCUSDT';
-const days = Math.min(30, Math.max(7, parseInt(process.argv[3] || '14', 10)));
+const days = Math.min(365, Math.max(1, parseInt(process.argv[3] || '14', 10)));
 const interval = process.argv[4] || '5m';
 const useAI = process.argv.includes('--ai');
 
