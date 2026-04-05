@@ -17,7 +17,7 @@ export type { TradeLog } from './types';
 const MAX_OPEN_TRADES = 2;
 const MAX_PORTFOLIO_RISK_FRAC = 0.02;
 /** Global cooldown after any new open. */
-const TRADE_COOLDOWN_MS = 20 * 60 * 1000;
+const TRADE_COOLDOWN_MS = 5 * 60 * 1000;
 /** After closing a symbol, block re-entry on that symbol. */
 const SYMBOL_REENTRY_COOLDOWN_MS = 30 * 60 * 1000;
 /** After 3 consecutive closed losses, pause new entries (BTC stability). */
@@ -63,6 +63,7 @@ function normalizeLoadedPosition(p: Partial<Position> & Record<string, unknown>)
     stopLoss: typeof p.stopLoss === 'number' ? p.stopLoss : entry,
     takeProfit: typeof p.takeProfit === 'number' ? p.takeProfit : entry,
     timestamp: typeof p.timestamp === 'number' ? p.timestamp : Date.now(),
+    initialStopDist: typeof p.initialStopDist === 'number' ? p.initialStopDist : Math.abs(entry - (typeof p.stopLoss === 'number' ? p.stopLoss : entry)),
   };
 }
 
@@ -153,6 +154,32 @@ export class TradingSystem {
       pos.side === 'LONG'
         ? (currentPrice - pos.entryPrice) * pos.amount
         : (pos.entryPrice - currentPrice) * pos.amount;
+
+    // Trailing stop logic
+    const stopDist = pos.initialStopDist ?? Math.abs(pos.entryPrice - pos.stopLoss);
+    const profitDist =
+      pos.side === 'LONG'
+        ? currentPrice - pos.entryPrice
+        : pos.entryPrice - currentPrice;
+
+    if (profitDist >= 1.5 * stopDist) {
+      // Move stop to breakeven once 75% of TP distance reached
+      if (pos.side === 'LONG') {
+        pos.stopLoss = Math.max(pos.stopLoss, pos.entryPrice);
+      } else {
+        pos.stopLoss = Math.min(pos.stopLoss, pos.entryPrice);
+      }
+    }
+    if (profitDist >= 2 * stopDist) {
+      // Trail stop 1 ATR behind current price
+      const trailingStop =
+        pos.side === 'LONG' ? currentPrice - stopDist : currentPrice + stopDist;
+      if (pos.side === 'LONG') {
+        pos.stopLoss = Math.max(pos.stopLoss, trailingStop);
+      } else {
+        pos.stopLoss = Math.min(pos.stopLoss, trailingStop);
+      }
+    }
   }
 
   private buildAiEnrichment(market: ReturnType<typeof analyzeMarketForTrading>): AiEnrichmentContext {

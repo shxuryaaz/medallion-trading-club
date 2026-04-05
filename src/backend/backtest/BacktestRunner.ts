@@ -11,7 +11,7 @@ import {
 
 const MAX_OPEN_TRADES = 2;
 const MAX_PORTFOLIO_RISK_FRAC = 0.02;
-const COOLDOWN_SEC = 20 * 60;
+const COOLDOWN_SEC = 5 * 60;
 const REENTRY_COOLDOWN_SEC = 30 * 60;
 const LOSS_STREAK_PAUSE_SEC = 60 * 60;
 const WINDOW = 100;

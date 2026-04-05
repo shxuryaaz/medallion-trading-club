@@ -547,6 +547,7 @@ export interface Position {
   stopLoss: number;
   takeProfit: number;
   timestamp: number;
+  initialStopDist: number; // ATR-based stop distance at entry, used for trailing stop logic
 }
 
 export class RiskAgent {
@@ -591,6 +592,7 @@ export class RiskAgent {
       stopLoss,
       takeProfit,
       timestamp: Date.now(),
+      initialStopDist: stopDist,
     };
   }
 }

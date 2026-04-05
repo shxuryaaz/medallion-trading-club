@@ -51,18 +51,25 @@ export class MomentumAgent {
     let score = 50;
     let reason = 'Neutral momentum';
 
+    // Trend-following: reward RSI strength in trend direction, don't penalize overbought/oversold
     if (lastRsi > 70) {
-      score = 30; // Overbought
-      reason = 'Overbought (RSI > 70)';
-    } else if (lastRsi < 30) {
-      score = 70; // Oversold
-      reason = 'Oversold (RSI < 30)';
+      score = 80;
+      reason = 'Very strong bullish momentum (RSI > 70)';
+    } else if (lastRsi > 60) {
+      score = 75;
+      reason = 'Strong bullish momentum (RSI > 60)';
     } else if (lastRsi > 50) {
       score = 60;
-      reason = 'Bullish momentum (RSI > 50)';
-    } else {
+      reason = 'Moderate bullish momentum (RSI > 50)';
+    } else if (lastRsi > 40) {
       score = 40;
-      reason = 'Bearish momentum (RSI < 50)';
+      reason = 'Moderate bearish momentum (RSI < 50)';
+    } else if (lastRsi > 30) {
+      score = 25;
+      reason = 'Strong bearish momentum (RSI < 40)';
+    } else {
+      score = 20;
+      reason = 'Very strong bearish momentum (RSI < 30)';
     }
 
     return { score, reason };
