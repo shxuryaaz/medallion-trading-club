@@ -39,9 +39,9 @@ function emaSeries(values: number[], period: number): number[] {
 const MIN_ATR_TO_PRICE = 0.00025;
 const MIN_EMA_SPREAD_TO_PRICE = 0.0008;
 
-/** BTCUSDT: skip if ATR% or EMA spread is weak (choppy / low conviction). */
+/** Skip if ATR% or EMA spread is weak (choppy / low conviction). */
 const LOW_REGIME_ATR_PCT = 0.00045;
-const LOW_REGIME_EMA_SPREAD = 0.0012;
+const LOW_REGIME_EMA_SPREAD = 0.0008; // was 0.0012 — matched MIN floor to allow moderate trends
 
 /** If atr/price is below this (but still passes MIN_ATR), use half risk budget. */
 export const LOW_ATR_HALVE_RISK_PCT = 0.00032;

@@ -30,7 +30,7 @@ export default function App() {
 
   const fetchOhlcv = async () => {
     try {
-      const res = await axios.get(`${API_BASE_URL}/api/ohlcv/${selectedSymbol}`);
+      const res = await axios.get(`${API_BASE_URL}/api/ohlcv/${selectedSymbol}?interval=15m`);
       setOhlcv(res.data);
     } catch (err) {
       console.error("Error fetching OHLCV:", err);

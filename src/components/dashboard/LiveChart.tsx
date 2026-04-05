@@ -82,7 +82,7 @@ export const LiveChart: React.FC<LiveChartProps> = ({ data, symbol }) => {
           Live Market: {symbol}
         </h3>
         <div className="flex gap-4 text-[10px] uppercase tracking-widest text-white/40">
-          <span>5M Interval</span>
+          <span>15M Interval</span>
           <span>Binance Spot</span>
         </div>
       </div>
