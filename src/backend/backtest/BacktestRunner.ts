@@ -258,7 +258,7 @@ export async function runBacktest(params: BacktestParams): Promise<BacktestResul
     if (!evaluation.execute || !evaluation.side) {
       if (evaluation.skipCause === 'score_neutral') {
         log(
-          `[BT SKIP] bar=${t} cause=score_neutral score=${evaluation.finalScore.toFixed(1)} (neutral 35–65; strong need >68 long or <32 short)`
+          `[BT SKIP] bar=${t} cause=score_neutral score=${evaluation.finalScore.toFixed(1)} (neutral 40–60; strong need >62 long or <38 short)`
         );
       } else {
         log(
