@@ -19,6 +19,12 @@ async function startServer() {
   app.use(cors());
   app.use(express.json());
 
+  app.get('/ping', (req, res) => {
+    const now = new Date().toISOString();
+    console.log(`[PING] UptimeRobot hit at ${now}`);
+    res.json({ status: 'ok', time: now });
+  });
+
   // API Routes
   app.get('/api/status', async (req, res) => {
     try {
