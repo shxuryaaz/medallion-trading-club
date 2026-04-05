@@ -6,4 +6,5 @@ coverage/
 *.log
 .env*
 !.env.example
-data/
+# Local runtime / DB artifacts at repo root only (not src/backend/data/)
+/data/
