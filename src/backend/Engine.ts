@@ -181,9 +181,9 @@ function entryTimingGates(data: OHLCV[], side: 'LONG' | 'SHORT'): { ok: true } |
   const lastIdx = data.length - 1;
   const prevIdx = data.length - 2;
 
-  // 0.1% tolerance: allow entry when close is within 0.1% of the breakout level
-  // (accounts for crypto wicks and noise — avoids requiring textbook-perfect breakouts)
-  const brkPad = price * 0.001;
+  // 0.3% tolerance: allow entry when close is within 0.3% of the breakout level
+  // 0.1% (~$67 on BTC) was too tight for 15m candles — increased to ~$200
+  const brkPad = price * 0.003;
 
   if (side === 'LONG') {
     if (!longBreakoutAtBar(data, lastIdx, -brkPad)) {
