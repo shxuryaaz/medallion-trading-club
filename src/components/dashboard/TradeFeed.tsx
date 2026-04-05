@@ -8,10 +8,50 @@ interface TradeFeedProps {
 export const TradeFeed: React.FC<TradeFeedProps> = ({ trades }) => {
   return (
     <div className="glass rounded-xl overflow-hidden">
-      <div className="p-6 border-b border-white/5">
-        <h3 className="text-sm font-bold uppercase tracking-widest">Trade Execution Feed</h3>
+      <div className="p-4 md:p-6 border-b border-white/5">
+        <h3 className="text-xs md:text-sm font-bold uppercase tracking-widest">Trade Feed</h3>
       </div>
-      <div className="overflow-x-auto overflow-y-auto max-h-[min(75vh,52rem)]">
+
+      {/* Mobile card view */}
+      <div className="md:hidden divide-y divide-white/5 overflow-y-auto max-h-[60vh]">
+        {trades.slice().reverse().map((trade) => (
+          <div key={trade.id} className="px-4 py-3 space-y-1.5">
+            <div className="flex justify-between items-center">
+              <span className="font-mono text-[10px] text-white/40">
+                {format(trade.timestamp, 'HH:mm:ss')}
+              </span>
+              <span className={`text-[9px] uppercase tracking-widest ${trade.status === 'OPEN' ? 'text-white animate-pulse' : 'text-white/20'}`}>
+                {trade.status}
+              </span>
+            </div>
+            <div className="flex justify-between items-center">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-medium">{trade.symbol}</span>
+                <span className={`px-1.5 py-0.5 rounded-sm text-[9px] font-bold uppercase ${trade.side === 'LONG' ? 'bg-white text-black' : 'bg-white/10 text-white'}`}>
+                  {trade.side}
+                </span>
+              </div>
+              <span className={`font-mono text-xs ${typeof trade.pnl === 'number' && trade.pnl >= 0 ? 'text-white' : 'text-white/40'}`}>
+                {trade.status === 'CLOSED' && typeof trade.pnl === 'number'
+                  ? `${trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}`
+                  : 'OPEN'}
+              </span>
+            </div>
+            <div className="flex gap-4 text-[10px] font-mono text-white/30">
+              <span>IN ${trade.entryPrice.toFixed(2)}</span>
+              {trade.exitPrice && <span>OUT ${trade.exitPrice.toFixed(2)}</span>}
+            </div>
+          </div>
+        ))}
+        {trades.length === 0 && (
+          <div className="px-4 py-10 text-center text-white/20 text-[10px] uppercase tracking-widest">
+            No trades yet
+          </div>
+        )}
+      </div>
+
+      {/* Desktop table view */}
+      <div className="hidden md:block overflow-x-auto overflow-y-auto max-h-[min(75vh,52rem)]">
         <table className="w-full text-left text-xs lg:text-sm">
           <thead>
             <tr className="text-[10px] uppercase tracking-widest text-white/40 border-b border-white/5">
