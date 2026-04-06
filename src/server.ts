@@ -1,6 +1,8 @@
 import 'dotenv/config';
+import http from 'http';
 import express from 'express';
 import cors from 'cors';
+import { WebSocketServer, WebSocket as WsSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -11,6 +13,7 @@ import { WebSocketManager } from './backend/data/WebSocketManager.ts';
 import { DataLayer } from './backend/DataLayer.ts';
 import { ScoringEngine } from './backend/Engine.ts';
 import { runBacktest } from './backend/backtest/BacktestRunner.ts';
+import { classifyWatchlistTicks } from './backend/watchlistTickClassify.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -178,7 +181,60 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  function makeWatchlistPayload() {
+    return {
+      type: 'watchlist' as const,
+      t: Date.now(),
+      cards: scalpEngine.getPanelWatchlistSymbols().map((symbol) => {
+        const prices = wsManager.getRecentPrices(symbol, 100);
+        const sig = scalpEngine.getLastSignal(symbol);
+        return {
+          symbol,
+          prices,
+          lastPrice: wsManager.getLatestPrice(symbol),
+          connected: wsManager.isConnected(symbol),
+          statusLabel: classifyWatchlistTicks(prices),
+          signal: sig
+            ? { decision: sig.decision, score: sig.score, reason: sig.reason }
+            : null,
+        };
+      }),
+    };
+  }
+
+  const server = http.createServer(app);
+  const wss = new WebSocketServer({ server, path: '/ws/watchlist' });
+  const watchlistClients = new Set<WsSocket>();
+  let watchlistInterval: ReturnType<typeof setInterval> | null = null;
+
+  const broadcastWatchlist = () => {
+    if (watchlistClients.size === 0) return;
+    const msg = JSON.stringify(makeWatchlistPayload());
+    for (const c of watchlistClients) {
+      if (c.readyState === WsSocket.OPEN) c.send(msg);
+    }
+  };
+
+  wss.on('connection', (socket) => {
+    watchlistClients.add(socket);
+    try {
+      socket.send(JSON.stringify(makeWatchlistPayload()));
+    } catch {
+      /* ignore */
+    }
+    if (!watchlistInterval) {
+      watchlistInterval = setInterval(broadcastWatchlist, 380);
+    }
+    socket.on('close', () => {
+      watchlistClients.delete(socket);
+      if (watchlistClients.size === 0 && watchlistInterval) {
+        clearInterval(watchlistInterval);
+        watchlistInterval = null;
+      }
+    });
+  });
+
+  server.listen(PORT, '0.0.0.0', () => {
     console.log(`Medallion Club Server running on http://localhost:${PORT}`);
 
     // Both engines start fire-and-forget — they never block each other.

@@ -8,6 +8,7 @@ import { PortfolioManager } from '../portfolio/PortfolioManager';
 import { WebSocketManager } from '../data/WebSocketManager';
 import { StateStore } from '../persistence/StateStore';
 import { closedTradeNetAmount, entryExitFees, feeOnNotional, minTpDistanceForFees } from '../fees';
+import { DEFAULT_WATCHLIST_PANEL_SYMBOLS } from '../../constants/watchlistPanel.ts';
 
 // ── Indicator helpers (inlined — no dependency on swing engine math) ──────────
 
@@ -358,6 +359,19 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/** Last evaluated scalp signal per symbol (memory only; used by /ws/watchlist). */
+export type ScalpLastSignal = {
+  decision: 'BUY' | 'SELL' | 'SKIP';
+  score: number;
+  reason: string;
+  timestamp: number;
+};
+
+function shortenScalpReason(reason: string, maxLen = 40): string {
+  const base = reason.split('(')[0]?.trim() ?? reason;
+  return base.replace(/\s+/g, '_').replace(/%/g, 'pct').slice(0, maxLen);
+}
+
 // ── ScalpingEngine ────────────────────────────────────────────────────────────
 
 export class ScalpingEngine {
@@ -375,6 +389,8 @@ export class ScalpingEngine {
   private watchlist: string[] = [];
   /** 1m OHLCV per symbol for HTF trend + ATR (TTL refresh). */
   private ohlcvCache = new Map<string, { bars: OHLCV[]; fetchedAt: number }>();
+
+  private lastSignalBySymbol = new Map<string, ScalpLastSignal>();
 
   constructor(portfolio: PortfolioManager, ws: WebSocketManager) {
     this.portfolio = portfolio;
@@ -422,6 +438,83 @@ export class ScalpingEngine {
       logs: this.logs,
       wsStatus: this.ws.getConnectionStatus(),
     };
+  }
+
+  /** Engine watchlist ∪ default panel symbols (for UI grid + WS broadcast). */
+  getPanelWatchlistSymbols(): string[] {
+    return [
+      ...new Set([
+        ...this.watchlist.map((s) => s.toUpperCase()),
+        ...DEFAULT_WATCHLIST_PANEL_SYMBOLS,
+      ]),
+    ];
+  }
+
+  getLastSignal(symbol: string): ScalpLastSignal | null {
+    return this.lastSignalBySymbol.get(symbol.toUpperCase()) ?? null;
+  }
+
+  /** Refresh in-memory signals for every panel symbol (each scan tick). */
+  private async refreshPanelSignals(): Promise<void> {
+    for (const raw of this.getPanelWatchlistSymbols()) {
+      const symbol = raw.toUpperCase();
+      const timestamp = Date.now();
+      const put = (s: ScalpLastSignal) => this.lastSignalBySymbol.set(symbol, s);
+
+      if (!this.isRunning) {
+        put({ decision: 'SKIP', score: 0, reason: 'engine_stopped', timestamp });
+        continue;
+      }
+      if (!this.watchlist.includes(symbol)) {
+        put({ decision: 'SKIP', score: 0, reason: 'not_on_watchlist', timestamp });
+        continue;
+      }
+      if (!this.ws.isReady(symbol, MIN_BUFFER_TICKS)) {
+        put({
+          decision: 'SKIP',
+          score: 0,
+          reason: `buffer_cold_${this.ws.getRecentPrices(symbol).length}`,
+          timestamp,
+        });
+        continue;
+      }
+
+      const prices = this.ws.getRecentPrices(symbol);
+      const vol = tickVolatilityGate(prices);
+      if (vol.ok === false) {
+        put({ decision: 'SKIP', score: 0, reason: shortenScalpReason(vol.reason), timestamp });
+        continue;
+      }
+      const noise = tickNoiseGate(prices);
+      if (noise.ok === false) {
+        put({ decision: 'SKIP', score: 0, reason: shortenScalpReason(noise.reason), timestamp });
+        continue;
+      }
+
+      const ctx = await this.ensureScalpMarketContext(symbol);
+      if (ctx == null) {
+        put({ decision: 'SKIP', score: 0, reason: 'htf_unavailable', timestamp });
+        continue;
+      }
+
+      const entry = this.evaluateEntry(prices, ctx);
+      if (!entry.ok) {
+        put({
+          decision: 'SKIP',
+          score: 0,
+          reason: shortenScalpReason(entry.reason),
+          timestamp,
+        });
+        continue;
+      }
+
+      put({
+        decision: entry.side === 'LONG' ? 'BUY' : 'SELL',
+        score: entry.score,
+        reason: 'entry_ok',
+        timestamp,
+      });
+    }
   }
 
   /**
@@ -630,6 +723,10 @@ export class ScalpingEngine {
       }
       await sleep(300);
     }
+
+    for (const symbol of this.getPanelWatchlistSymbols()) {
+      this.ws.subscribe(symbol);
+    }
   }
 
   /** Cached 1m bars + pseudo-5m EMA trend; refreshes on TTL. */
@@ -720,6 +817,8 @@ export class ScalpingEngine {
   // ── Entry scanning ────────────────────────────────────────────────────────
 
   private async scanAndTrade(): Promise<void> {
+    await this.refreshPanelSignals();
+
     // Pause check
     if (Date.now() < this.lossStreakPauseUntil) {
       const secsLeft = Math.ceil((this.lossStreakPauseUntil - Date.now()) / 1000);

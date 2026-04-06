@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect } from "react";
 import axios from "axios";
 import { API_BASE_URL } from "./config";
 import { motion, AnimatePresence } from "motion/react";
@@ -8,7 +8,7 @@ import { AgentInsights } from "./components/dashboard/AgentInsights";
 import { TradeFeed } from "./components/dashboard/TradeFeed";
 import { SystemStatus } from "./components/dashboard/SystemStatus";
 import { ScalpDashboard, type ScalpSnapshot } from "./components/dashboard/ScalpDashboard";
-import { WatchlistCharts, WATCHLIST_PANEL_DEFAULT } from "./components/dashboard/WatchlistCharts";
+import { WatchlistCharts } from "./components/dashboard/WatchlistCharts";
 import { Shield, Settings, LogOut, Bell, Activity } from "lucide-react";
 import { MedallionLogo } from "./components/branding/MedallionLogo";
 
@@ -113,12 +113,6 @@ export default function App() {
     tradeHistory: [],
     logs: [],
   };
-
-  const watchlistPanelSymbols = useMemo(() => {
-    const w = scalpSnapshot?.watchlist;
-    if (w?.length) return [...new Set(w.map((s) => s.toUpperCase()))];
-    return [...WATCHLIST_PANEL_DEFAULT];
-  }, [scalpSnapshot?.watchlist]);
 
   if (loading) {
     return (
@@ -248,11 +242,7 @@ export default function App() {
                 activePositions={safeStatus.activePositions}
               />
 
-              <WatchlistCharts
-                symbols={watchlistPanelSymbols}
-                selectedSymbol={selectedSymbol}
-                onSelectSymbol={setSelectedSymbol}
-              />
+              <WatchlistCharts selectedSymbol={selectedSymbol} onSelectSymbol={setSelectedSymbol} />
 
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-8">
                 <div className="lg:col-span-2">
