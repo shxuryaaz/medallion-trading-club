@@ -690,7 +690,8 @@ export class ScalpingEngine {
    * Subscribe cold if bootstrap REST fails — WS fills the tick buffer over time.
    */
   private async bootstrap(): Promise<void> {
-    this.watchlist = DataLayer.getStaticScalpWatchlist(5);
+    // Full static universe (DataLayer clamps to STATIC_USDT_UNIVERSE length; boot spacing avoids REST burst).
+    this.watchlist = DataLayer.getStaticScalpWatchlist(64);
     this.addLog(`Scalp watchlist (static): ${this.watchlist.join(', ')}`);
 
     for (const symbol of this.watchlist) {

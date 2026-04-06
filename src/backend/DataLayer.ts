@@ -21,9 +21,10 @@ const STATIC_USDT_UNIVERSE = [
   'SOLUSDT',
   'BNBUSDT',
   'XRPUSDT',
-  'ADAUSDT',
   'DOGEUSDT',
+  'AVAXUSDT',
   'LINKUSDT',
+  'PEPEUSDT',
 ] as const;
 
 /**
