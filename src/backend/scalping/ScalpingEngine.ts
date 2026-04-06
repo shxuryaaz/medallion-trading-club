@@ -324,8 +324,8 @@ const PULLBACK_W           = 20;
 const NOISE_K              = 28;
 const MICRO_NOISE_FLOOR    = 5e-7;
 const FLIP_MAX             = 14;
-const CONSISTENCY_MIN      = 0.18;
-const ENTRY_SCORE_MIN      = 65;
+const CONSISTENCY_MIN      = 0.1;
+const ENTRY_SCORE_MIN      = 60;
 const SCORE_SIZE_MIN       = 0.45;            // size scale at minimum qualifying score
 
 interface ScalpMarketContext {
