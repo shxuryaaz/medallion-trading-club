@@ -7,11 +7,24 @@ interface PortfolioProps {
   activePositions: any[];
 }
 
+function unrealizedForPosition(pos: any): number {
+  if (typeof pos.unrealizedPnl === 'number' && Number.isFinite(pos.unrealizedPnl)) {
+    return pos.unrealizedPnl;
+  }
+  const { entryPrice: ep, currentPrice: cp, amount: amt, side } = pos;
+  if (
+    typeof ep === 'number' &&
+    typeof amt === 'number' &&
+    typeof cp === 'number' &&
+    (side === 'LONG' || side === 'SHORT')
+  ) {
+    return side === 'LONG' ? (cp - ep) * amt : (ep - cp) * amt;
+  }
+  return 0;
+}
+
 export const PortfolioOverview: React.FC<PortfolioProps> = ({ balance, activePositions }) => {
-  const totalPnL = activePositions.reduce(
-    (acc, pos) => acc + (typeof pos.unrealizedPnl === 'number' ? pos.unrealizedPnl : 0),
-    0
-  );
+  const totalPnL = activePositions.reduce((acc, pos) => acc + unrealizedForPosition(pos), 0);
   
   return (
     <div className="grid grid-cols-1 md:grid-cols-3 gap-3 sm:gap-4 md:gap-6">

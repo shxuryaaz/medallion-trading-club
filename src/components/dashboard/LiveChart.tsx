@@ -46,11 +46,11 @@ export const LiveChart: React.FC<LiveChartProps> = ({ data, symbol }) => {
     });
 
     const candlestickSeries = chart.addSeries(CandlestickSeries, {
-      upColor: '#fff',
-      downColor: '#444',
+      upColor: '#22c55e',
+      downColor: '#ef4444',
       borderVisible: false,
-      wickUpColor: '#fff',
-      wickDownColor: '#444',
+      wickUpColor: '#22c55e',
+      wickDownColor: '#ef4444',
     });
 
     chartRef.current = chart;

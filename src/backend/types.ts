@@ -21,4 +21,10 @@ export interface TradeLog {
     momentumStrength: number;
     volShort: number;
   };
+  /** Planned exit distances at open (scalp only). */
+  scalpRiskReward?: {
+    slDistance: number;
+    tpDistance: number;
+    riskReward: number;
+  };
 }

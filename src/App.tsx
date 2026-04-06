@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import axios from "axios";
 import { API_BASE_URL } from "./config";
 import { motion, AnimatePresence } from "motion/react";
@@ -8,9 +8,18 @@ import { AgentInsights } from "./components/dashboard/AgentInsights";
 import { TradeFeed } from "./components/dashboard/TradeFeed";
 import { SystemStatus } from "./components/dashboard/SystemStatus";
 import { ScalpDashboard, type ScalpSnapshot } from "./components/dashboard/ScalpDashboard";
+import { WatchlistCharts, WATCHLIST_PANEL_DEFAULT } from "./components/dashboard/WatchlistCharts";
 import { Shield, Settings, LogOut, Bell, Activity } from "lucide-react";
+import { MedallionLogo } from "./components/branding/MedallionLogo";
 
-const SYMBOL_OPTIONS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"] as const;
+const SYMBOL_OPTIONS = [
+  "BTCUSDT",
+  "ETHUSDT",
+  "SOLUSDT",
+  "BNBUSDT",
+  "STOUSDT",
+  "USDCUSDT",
+] as const;
 
 export default function App() {
   const [status, setStatus] = useState<any>(null);
@@ -105,6 +114,12 @@ export default function App() {
     logs: [],
   };
 
+  const watchlistPanelSymbols = useMemo(() => {
+    const w = scalpSnapshot?.watchlist;
+    if (w?.length) return [...new Set(w.map((s) => s.toUpperCase()))];
+    return [...WATCHLIST_PANEL_DEFAULT];
+  }, [scalpSnapshot?.watchlist]);
+
   if (loading) {
     return (
       <div className="min-h-dvh pt-safe px-4 bg-black flex items-center justify-center">
@@ -132,12 +147,14 @@ export default function App() {
 
       {/* Desktop Sidebar */}
       <div className="hidden md:flex fixed left-0 top-0 bottom-0 w-20 border-r border-white/5 flex-col items-center py-8 gap-12 z-50 bg-black">
-        <div
-          className="w-10 h-10 bg-white rounded-full flex items-center justify-center cursor-pointer"
+        <button
+          type="button"
+          className="w-10 h-10 rounded-full flex items-center justify-center cursor-pointer text-white hover:opacity-90 transition-opacity focus:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
           onClick={() => setActiveView("dashboard")}
+          aria-label="Medallion Club — Dashboard"
         >
-          <div className="w-5 h-5 bg-black rounded-sm rotate-45" />
-        </div>
+          <MedallionLogo size={36} />
+        </button>
 
         <div className="flex flex-col gap-8">
           {navItems.map(({ view, icon: Icon }) => (
@@ -182,14 +199,17 @@ export default function App() {
       <div className="md:pl-20 pb-nav-mobile md:pb-0">
         {/* Header */}
         <header className="pt-safe px-4 md:px-12 py-3 md:py-8 border-b border-white/5 flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-center bg-black/50 backdrop-blur-sm sticky top-0 z-40">
-          <div className="min-w-0">
-            <h1 className="text-base md:text-xl font-bold uppercase tracking-widest truncate">
-              {activeView === "dashboard" && "Medallion Club"}
-              {activeView === "settings" && "Configuration"}
-              {activeView === "activity" && "Activity"}
-            </h1>
-            <div className="text-[10px] md:text-[10px] uppercase tracking-widest text-white/40 mt-0.5">
-              Multi-Agent Trading System
+          <div className="min-w-0 flex items-start gap-3">
+            <MedallionLogo size={36} className="shrink-0 text-white md:hidden" />
+            <div className="min-w-0">
+              <h1 className="text-base md:text-xl font-bold uppercase tracking-widest truncate">
+                {activeView === "dashboard" && "Medallion Club"}
+                {activeView === "settings" && "Configuration"}
+                {activeView === "activity" && "Activity"}
+              </h1>
+              <div className="text-[10px] md:text-[10px] uppercase tracking-widest text-white/40 mt-0.5">
+                Multi-Agent Trading System
+              </div>
             </div>
           </div>
 
@@ -226,6 +246,12 @@ export default function App() {
               <PortfolioOverview
                 balance={safeStatus.balance}
                 activePositions={safeStatus.activePositions}
+              />
+
+              <WatchlistCharts
+                symbols={watchlistPanelSymbols}
+                selectedSymbol={selectedSymbol}
+                onSelectSymbol={setSelectedSymbol}
               />
 
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-8">

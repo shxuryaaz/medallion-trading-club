@@ -7,7 +7,7 @@ import type { TradeLog } from '../types';
 import { PortfolioManager } from '../portfolio/PortfolioManager';
 import { WebSocketManager } from '../data/WebSocketManager';
 import { StateStore } from '../persistence/StateStore';
-import { closedTradeNetAmount, entryExitFees, minTpDistanceForFees } from '../fees';
+import { closedTradeNetAmount, entryExitFees, feeOnNotional, minTpDistanceForFees } from '../fees';
 
 // ── Indicator helpers (inlined — no dependency on swing engine math) ──────────
 
@@ -307,12 +307,14 @@ const OHLCV_FETCH_LIMIT    = 130;
 const OHLCV_CACHE_TTL_MS   = 100_000;
 const HTF_MIN_5M_BARS      = 22;              // ≥21 closes for EMA21 seed + value
 
-// ATR-based SL / TP (TP = RR × SL distance)
+// ATR-based SL / TP (exit-only tuning — entry logic unchanged)
 const ATR_PERIOD_SCALP     = 14;
 const ATR_STOP_MULT        = 1.25;
 const SL_MIN_PCT           = 0.0025;          // 0.25% floor on stop distance
 const SL_MAX_PCT           = 0.005;           // 0.50% cap
-const TP_RR                = 1.5;             // 1.2–1.8 band; fixed midpoint
+const SL_TIGHTEN_MULT      = 0.9;             // slightly tighter stop vs raw ATR clamp
+const TP_RR                = 1.5;             // baseline RR on SL distance
+const TP_MIN_R_MULT        = 1.2;              // TP distance >= this × SL distance
 
 // Entry quality — acceleration, pullback, noise, score, sizing
 const ACCEL_BLOCK_N        = 5;
@@ -572,10 +574,17 @@ export class ScalpingEngine {
     };
   }
 
-  // Mark open positions from REST (called from /api/status if needed)
+  /**
+   * Mark open positions for API/UI. Prefer live WS; if missing (engine off, cold buffer,
+   * or symbol not subscribed), fall back to last 1m close like the swing engine.
+   */
   async refreshOpenPositionMarks(): Promise<void> {
     for (const pos of this.activePositions) {
-      const price = this.ws.getLatestPrice(pos.symbol);
+      let price = this.ws.getLatestPrice(pos.symbol);
+      if (price == null) {
+        const data = await DataLayer.fetchOHLCV(pos.symbol, '1m', 1);
+        if (data.length > 0) price = data[0].close;
+      }
       if (price != null) this.applyMark(pos, price);
     }
   }
@@ -603,6 +612,23 @@ export class ScalpingEngine {
         this.addLog(`[boot] ${symbol}: REST seed failed → WS subscribed cold`);
       }
       await sleep(300); // small spacing to avoid rate-limit spike on boot
+    }
+
+    // Open positions may use symbols outside the current top-N watchlist — subscribe + seed for monitoring
+    const extraSyms = [
+      ...new Set(this.activePositions.map((p) => p.symbol).filter((s) => !this.watchlist.includes(s))),
+    ];
+    for (const symbol of extraSyms) {
+      try {
+        const ohlcv: OHLCV[] = await DataLayer.fetchOHLCV(symbol, '1m', OHLCV_FETCH_LIMIT);
+        const prices = ohlcv.map((c) => c.close);
+        this.ws.subscribe(symbol, prices.length ? prices : undefined);
+        this.addLog(`[boot] ${symbol}: WS for open position (not on watchlist)`);
+      } catch {
+        this.ws.subscribe(symbol);
+        this.addLog(`[boot] ${symbol}: WS cold (open position)`);
+      }
+      await sleep(300);
     }
   }
 
@@ -898,8 +924,10 @@ export class ScalpingEngine {
     const rawSl = ATR_STOP_MULT * atr;
     const slMin = price * SL_MIN_PCT;
     const slMax = price * SL_MAX_PCT;
-    const slDist = Math.min(slMax, Math.max(slMin, rawSl));
-    const tpDist = slDist * TP_RR;
+    const clamped = Math.min(slMax, Math.max(slMin, rawSl));
+    const slDist = Math.max(slMin, clamped * SL_TIGHTEN_MULT);
+    const existingTpDist = slDist * TP_RR;
+    const tpDist = Math.max(TP_MIN_R_MULT * slDist, existingTpDist);
     const sl      = side === 'LONG' ? price - slDist : price + slDist;
     const tp      = side === 'LONG' ? price + tpDist : price - tpDist;
     const riskAmt = slDist * amount; // dollars at risk if SL hit
@@ -911,6 +939,19 @@ export class ScalpingEngine {
       );
       return;
     }
+
+    // Fee-aware: net price move to TP must exceed stop distance (same units as SL risk)
+    const roundTripFees = feeOnNotional(price, amount) + feeOnNotional(tp, amount);
+    const netTpMovePerUnit = tpDist - roundTripFees / amount;
+    if (netTpMovePerUnit <= slDist) {
+      this.addLog(
+        `SKIP ${symbol} ${side} cause=fee_rr(netTPmove=${netTpMovePerUnit.toFixed(6)} need>${slDist.toFixed(6)} ` +
+          `tpDist=${tpDist.toFixed(6)} fees/amt=${(roundTripFees / amount).toFixed(6)})`
+      );
+      return;
+    }
+
+    const riskReward = tpDist / slDist;
 
     // Portfolio gate — synchronous check + register (atomic in Node.js)
     const allocation = this.portfolio.requestCapital(ENGINE_ID, symbol, riskAmt);
@@ -950,6 +991,11 @@ export class ScalpingEngine {
         momentumStrength: entryQuality.momentumStrength,
         volShort: entryQuality.volShort,
       },
+      scalpRiskReward: {
+        slDistance: slDist,
+        tpDistance: tpDist,
+        riskReward,
+      },
     };
 
     // Register with portfolio (synchronous — no await between requestCapital and here)
@@ -963,6 +1009,7 @@ export class ScalpingEngine {
     this.addLog(
       `OPEN ${side} ${symbol} @ ${price.toFixed(4)} ` +
       `SL=${sl.toFixed(4)} TP=${tp.toFixed(4)} ` +
+      `slDist=${slDist.toFixed(6)} tpDist=${tpDist.toFixed(6)} R:R=${riskReward.toFixed(2)} ` +
       `size=${notional.toFixed(2)}$ scale=${scale.toFixed(2)} ` +
       `score=${entryQuality.score} momStr=${entryQuality.momentumStrength.toExponential(2)} ` +
       `volShort=${entryQuality.volShort.toExponential(2)} | ${signalReason}`
