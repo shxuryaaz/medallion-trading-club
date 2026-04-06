@@ -293,7 +293,8 @@ const MIN_RSI_SHORT_ENTRY  = 30;              // overextension — no SHORT if R
 const MAX_STRETCH_FROM_EMA = 0.0025;          // max |price-ema21|/ema21 for entry (0.25%)
 const MIN_MOM_LOOKBACK     = 5;
 const MIN_MOM_PCT          = 0.00015;         // min |Δprice|/price over lookback (~0.015%)
-const MIN_BUFFER_TICKS     = 130;             // covers vol long window + EMA21
+const MIN_BUFFER_TICKS       = 130;             // covers vol long window + EMA21 (when HTF cache seeded)
+const MIN_BUFFER_TICKS_COLD = 60;              // WS-only warmup when 1m cache missing / thinner context
 
 // Tick volatility (simple return stdev)
 const VOL_SHORT_RETURNS    = 40;
@@ -303,9 +304,8 @@ const MAX_TICK_VOL         = 0.0022;          // above = too wild
 const VOL_SPIKE_RATIO      = 3.0;
 const VOL_LONG_VOL_FLOOR   = 1e-7;            // avoid div-by-zero in spike ratio
 
-// Cached 1m bars for HTF + ATR
+// Cached 1m bars for HTF (TTL enforced in DataLayer.getScalpContext1m — no REST in hot path beyond cache refresh)
 const OHLCV_FETCH_LIMIT    = 130;
-const OHLCV_CACHE_TTL_MS   = 100_000;
 const HTF_MIN_5M_BARS      = 22;              // ≥21 closes for EMA21 seed + value
 
 // ATR-based SL / TP (exit-only tuning — entry logic unchanged)
@@ -392,6 +392,12 @@ export class ScalpingEngine {
 
   private lastSignalBySymbol = new Map<string, ScalpLastSignal>();
 
+  private minBufferTicksFor(symbol: string): number {
+    const ent = this.ohlcvCache.get(symbol);
+    if (ent && ent.bars.length >= HTF_MIN_5M_BARS * 5) return MIN_BUFFER_TICKS;
+    return MIN_BUFFER_TICKS_COLD;
+  }
+
   constructor(portfolio: PortfolioManager, ws: WebSocketManager) {
     this.portfolio = portfolio;
     this.ws        = ws;
@@ -469,7 +475,7 @@ export class ScalpingEngine {
         put({ decision: 'SKIP', score: 0, reason: 'not_on_watchlist', timestamp });
         continue;
       }
-      if (!this.ws.isReady(symbol, MIN_BUFFER_TICKS)) {
+      if (!this.ws.isReady(symbol, this.minBufferTicksFor(symbol))) {
         put({
           decision: 'SKIP',
           score: 0,
@@ -578,7 +584,7 @@ export class ScalpingEngine {
       return { ...base, skipReason: 'engine_stopped' };
     }
 
-    if (!this.ws.isReady(symbol, MIN_BUFFER_TICKS)) {
+    if (!this.ws.isReady(symbol, this.minBufferTicksFor(symbol))) {
       return {
         ...base,
         skipReason: `buffer_cold(${prices.length})`,
@@ -668,16 +674,11 @@ export class ScalpingEngine {
   }
 
   /**
-   * Mark open positions for API/UI. Prefer live WS; if missing (engine off, cold buffer,
-   * or symbol not subscribed), fall back to last 1m close like the swing engine.
+   * Mark open positions for API/UI — WebSocket only (no REST in the hot path).
    */
   async refreshOpenPositionMarks(): Promise<void> {
     for (const pos of this.activePositions) {
-      let price = this.ws.getLatestPrice(pos.symbol);
-      if (price == null) {
-        const data = await DataLayer.fetchOHLCV(pos.symbol, '1m', 1);
-        if (data.length > 0) price = data[0].close;
-      }
+      const price = this.ws.getLatestPrice(pos.symbol);
       if (price != null) this.applyMark(pos, price);
     }
   }
@@ -685,35 +686,34 @@ export class ScalpingEngine {
   // ── Bootstrap ─────────────────────────────────────────────────────────────
 
   /**
-   * Fetch top 5 coins, seed each WS buffer with 1m REST data, then subscribe.
-   * One REST burst per symbol at boot; cache primes HTF/ATR until TTL refresh.
+   * Static watchlist; one cached 1m kline fetch per symbol at boot (DataLayer TTL thereafter).
+   * Subscribe cold if bootstrap REST fails — WS fills the tick buffer over time.
    */
   private async bootstrap(): Promise<void> {
-    this.watchlist = await DataLayer.fetchTopCoins(5);
-    this.addLog(`Scalp watchlist: ${this.watchlist.join(', ')}`);
+    this.watchlist = DataLayer.getStaticScalpWatchlist(5);
+    this.addLog(`Scalp watchlist (static): ${this.watchlist.join(', ')}`);
 
     for (const symbol of this.watchlist) {
       try {
-        const ohlcv: OHLCV[] = await DataLayer.fetchOHLCV(symbol, '1m', OHLCV_FETCH_LIMIT);
+        const ohlcv: OHLCV[] = await DataLayer.getScalpContext1m(symbol, OHLCV_FETCH_LIMIT);
         this.ohlcvCache.set(symbol, { bars: ohlcv, fetchedAt: Date.now() });
         const prices = ohlcv.map(c => c.close);
-        this.ws.subscribe(symbol, prices);
+        this.ws.subscribe(symbol, prices.length ? prices : undefined);
         this.addLog(`[boot] ${symbol}: seeded ${prices.length} bars → WS live`);
       } catch {
-        // If REST fails, subscribe anyway — WS will build up ticks over time
         this.ws.subscribe(symbol);
         this.addLog(`[boot] ${symbol}: REST seed failed → WS subscribed cold`);
       }
-      await sleep(300); // small spacing to avoid rate-limit spike on boot
+      await sleep(300);
     }
 
-    // Open positions may use symbols outside the current top-N watchlist — subscribe + seed for monitoring
     const extraSyms = [
       ...new Set(this.activePositions.map((p) => p.symbol).filter((s) => !this.watchlist.includes(s))),
     ];
     for (const symbol of extraSyms) {
       try {
-        const ohlcv: OHLCV[] = await DataLayer.fetchOHLCV(symbol, '1m', OHLCV_FETCH_LIMIT);
+        const ohlcv: OHLCV[] = await DataLayer.getScalpContext1m(symbol, OHLCV_FETCH_LIMIT);
+        this.ohlcvCache.set(symbol, { bars: ohlcv, fetchedAt: Date.now() });
         const prices = ohlcv.map((c) => c.close);
         this.ws.subscribe(symbol, prices.length ? prices : undefined);
         this.addLog(`[boot] ${symbol}: WS for open position (not on watchlist)`);
@@ -729,24 +729,12 @@ export class ScalpingEngine {
     }
   }
 
-  /** Cached 1m bars + pseudo-5m EMA trend; refreshes on TTL. */
+  /** Cached 1m bars + pseudo-5m EMA trend; network refresh rate-limited in DataLayer.getScalpContext1m. */
   private async ensureScalpMarketContext(symbol: string): Promise<ScalpMarketContext | null> {
-    const now = Date.now();
-    const ent = this.ohlcvCache.get(symbol);
-    if (ent && now - ent.fetchedAt < OHLCV_CACHE_TTL_MS) {
-      const flags = htfTrendFlags(ent.bars);
-      if (flags == null) return null;
-      return {
-        ohlcv: ent.bars,
-        allowsLong: flags.allowsLong,
-        allowsShort: flags.allowsShort,
-        htfSpreadPct: flags.htfSpreadPct,
-      };
-    }
     try {
-      const bars = await DataLayer.fetchOHLCV(symbol, '1m', OHLCV_FETCH_LIMIT);
+      const bars = await DataLayer.getScalpContext1m(symbol, OHLCV_FETCH_LIMIT);
       if (bars.length < HTF_MIN_5M_BARS * 5) return null;
-      this.ohlcvCache.set(symbol, { bars, fetchedAt: now });
+      this.ohlcvCache.set(symbol, { bars, fetchedAt: Date.now() });
       const flags = htfTrendFlags(bars);
       if (flags == null) return null;
       return {
@@ -844,7 +832,7 @@ export class ScalpingEngine {
       if (Date.now() - lastClosed < SYMBOL_POST_CLOSE_COOLDOWN_MS) continue;
 
       // WebSocket buffer must be warm
-      if (!this.ws.isReady(symbol, MIN_BUFFER_TICKS)) {
+      if (!this.ws.isReady(symbol, this.minBufferTicksFor(symbol))) {
         this.addLog(`SKIP ${symbol} cause=buffer_cold(${this.ws.getRecentPrices(symbol).length}ticks)`);
         continue;
       }

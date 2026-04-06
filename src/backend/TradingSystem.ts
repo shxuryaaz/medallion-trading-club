@@ -244,9 +244,9 @@ export class TradingSystem {
 
   async refreshOpenPositionMarks(): Promise<void> {
     for (const pos of this.activePositions) {
-      const data = await DataLayer.fetchOHLCV(pos.symbol, '1m', 1);
-      if (data.length === 0) continue;
-      this.markPosition(pos, data[0].close);
+      const close = await DataLayer.getLast1mClose(pos.symbol);
+      if (close == null) continue;
+      this.markPosition(pos, close);
     }
   }
 
@@ -283,7 +283,7 @@ export class TradingSystem {
       return;
     }
 
-    const topCoins = await DataLayer.fetchTopCoins(5);
+    const topCoins = DataLayer.getStaticScalpWatchlist(5);
 
     for (const symbol of topCoins) {
       if (this.activePositions.find((p) => p.symbol === symbol)) continue;
@@ -306,7 +306,7 @@ export class TradingSystem {
       }
 
       await new Promise((r) => setTimeout(r, 1000));
-      const data = await DataLayer.fetchOHLCV(symbol, '15m', 100);
+      const data = await DataLayer.getSwingScan15m(symbol, 100);
       if (data.length === 0) continue;
 
       const market = analyzeMarketForTrading(data);
