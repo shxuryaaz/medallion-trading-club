@@ -285,14 +285,14 @@ const LOSS_STREAK_PAUSE_MS = 30 * 60_000;     // 30 min pause after 5 consecutiv
 const LOSS_STREAK_COUNT    = 5;               // losses in a row before pause
 const MAX_POSITIONS        = 3;               // max concurrent scalp trades
 const NOTIONAL_FRAC        = 0.08;            // 8% of balance per trade notional
-const MIN_EMA_SPREAD_PCT   = 0.0005;          // EMA9/21 must be at least 0.05% apart
-const MIN_RSI_LONG         = 52;              // RSI must be above this for LONG
-const MAX_RSI_SHORT        = 48;              // RSI must be below this for SHORT
+const MIN_EMA_SPREAD_PCT   = 0.00025;         // EMA9/21 must be at least ~0.025% apart
+const MIN_RSI_LONG         = 50;              // RSI must be above this for LONG
+const MAX_RSI_SHORT        = 50;              // RSI must be below this for SHORT
 const MAX_RSI_LONG_ENTRY   = 70;              // overextension — no LONG if RSI above this
 const MIN_RSI_SHORT_ENTRY  = 30;              // overextension — no SHORT if RSI below this
 const MAX_STRETCH_FROM_EMA = 0.0025;          // max |price-ema21|/ema21 for entry (0.25%)
 const MIN_MOM_LOOKBACK     = 5;
-const MIN_MOM_PCT          = 0.00015;         // min |Δprice|/price over lookback (~0.015%)
+const MIN_MOM_PCT          = 0.000105;        // min |Δprice|/price over lookback (~30% relaxed vs prior)
 const MIN_BUFFER_TICKS       = 130;             // covers vol long window + EMA21 (when HTF cache seeded)
 const MIN_BUFFER_TICKS_COLD = 60;              // WS-only warmup when 1m cache missing / thinner context
 
@@ -902,7 +902,23 @@ export class ScalpingEngine {
       }
     }
 
-    if (ema9 > ema21 && rsiVal > MIN_RSI_LONG && mom === 'up') {
+    const longAlign =
+      (ema9 > ema21 ? 1 : 0) + (rsiVal > MIN_RSI_LONG ? 1 : 0) + (mom === 'up' ? 1 : 0);
+    const shortAlign =
+      (ema9 < ema21 ? 1 : 0) + (rsiVal < MAX_RSI_SHORT ? 1 : 0) + (mom === 'down' ? 1 : 0);
+
+    let primary: 'LONG' | 'SHORT' | null = null;
+    if (longAlign >= 2 && shortAlign >= 2) {
+      if (longAlign > shortAlign) primary = 'LONG';
+      else if (shortAlign > longAlign) primary = 'SHORT';
+      else primary = mom === 'down' ? 'SHORT' : 'LONG';
+    } else if (longAlign >= 2) {
+      primary = 'LONG';
+    } else if (shortAlign >= 2) {
+      primary = 'SHORT';
+    }
+
+    if (primary === 'LONG') {
       if (!ctx.allowsLong) {
         return { ok: false, reason: 'htf_not_uptrend' };
       }
@@ -937,11 +953,11 @@ export class ScalpingEngine {
         score,
         momentumStrength: ac.strengthRecent,
         volShort,
-        reason: `LONG rsi=${rsiVal.toFixed(1)} spread=${(spread * 100).toFixed(3)}% score=${score}`,
+        reason: `LONG align=${longAlign}/3 rsi=${rsiVal.toFixed(1)} spread=${(spread * 100).toFixed(3)}% score=${score}`,
       };
     }
 
-    if (ema9 < ema21 && rsiVal < MAX_RSI_SHORT && mom === 'down') {
+    if (primary === 'SHORT') {
       if (!ctx.allowsShort) {
         return { ok: false, reason: 'htf_not_downtrend' };
       }
@@ -976,14 +992,14 @@ export class ScalpingEngine {
         score,
         momentumStrength: ac.strengthRecent,
         volShort,
-        reason: `SHORT rsi=${rsiVal.toFixed(1)} spread=${(spread * 100).toFixed(3)}% score=${score}`,
+        reason: `SHORT align=${shortAlign}/3 rsi=${rsiVal.toFixed(1)} spread=${(spread * 100).toFixed(3)}% score=${score}`,
       };
     }
 
     const dir = ema9 > ema21 ? 'bullish' : 'bearish';
     return {
       ok: false,
-      reason: `no_signal(${dir} rsi=${rsiVal.toFixed(1)} mom=${mom})`,
+      reason: `no_signal(${dir} rsi=${rsiVal.toFixed(1)} mom=${mom} longAlign=${longAlign} shortAlign=${shortAlign})`,
     };
   }
 

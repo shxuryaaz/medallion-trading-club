@@ -119,7 +119,12 @@ function shortBreakoutAtBar(data: OHLCV[], barIndex: number, pad: number): boole
   return px < minLow - pad;
 }
 
-function entryTimingGates(data: OHLCV[], side: 'LONG' | 'SHORT'): { ok: true } | EntryTimingFail {
+type EntryTimingOk = { ok: true; scorePenalty: number; timingTags: string[] };
+
+function entryTimingGates(data: OHLCV[], side: 'LONG' | 'SHORT'): EntryTimingOk | EntryTimingFail {
+  let scorePenalty = 0;
+  const timingTags: string[] = [];
+
   if (data.length < 55) {
     return {
       ok: false,
@@ -239,7 +244,8 @@ function entryTimingGates(data: OHLCV[], side: 'LONG' | 'SHORT'): { ok: true } |
       return { ok: false, reason: 'long_ema50_not_rising', skipCause: 'entry_timing' };
     }
     if (prev.close <= prev.open) {
-      return { ok: false, reason: 'long_prev_candle_not_bullish', skipCause: 'entry_timing' };
+      scorePenalty += 5;
+      timingTags.push('long_prev_candle_not_bullish');
     }
   } else {
     if (price >= ema20Now) {
@@ -252,7 +258,8 @@ function entryTimingGates(data: OHLCV[], side: 'LONG' | 'SHORT'): { ok: true } |
       return { ok: false, reason: 'short_ema50_not_falling', skipCause: 'entry_timing' };
     }
     if (prev.close >= prev.open) {
-      return { ok: false, reason: 'short_prev_candle_not_bearish', skipCause: 'entry_timing' };
+      scorePenalty += 5;
+      timingTags.push('short_prev_candle_not_bearish');
     }
   }
 
@@ -291,7 +298,7 @@ function entryTimingGates(data: OHLCV[], side: 'LONG' | 'SHORT'): { ok: true } |
     }
   }
 
-  return { ok: true };
+  return { ok: true, scorePenalty, timingTags };
 }
 
 export function analyzeMarketForTrading(data: OHLCV[]): {
@@ -419,10 +426,25 @@ export class ScoringEngine {
       };
     }
 
+    const adjustedScore = finalScore - gates.scorePenalty;
+    const bandAfter = classifyEntryScore(adjustedScore);
+    if (bandAfter.kind !== 'strong' || bandAfter.side !== side) {
+      const tagStr = gates.timingTags.length ? gates.timingTags.join(',') : 'penalty';
+      return {
+        execute: false,
+        side,
+        finalScore,
+        signals,
+        ai: null,
+        reason: `Entry timing: ${tagStr} → score ${adjustedScore.toFixed(1)} (need strong ${side})`,
+        skipCause: 'entry_timing',
+      };
+    }
+
     const ai = await OpenAIService.getSecondOpinion({
       symbol,
       lastPrice,
-      finalScore,
+      finalScore: adjustedScore,
       signals,
       proposedAction,
       enrichment,
@@ -467,13 +489,16 @@ export class ScoringEngine {
       };
     }
 
+    const timingNote =
+      gates.timingTags.length > 0 ? `[timing: ${gates.timingTags.join(',')}] ` : '';
+
     return {
       execute: true,
       side: side!,
-      finalScore,
+      finalScore: adjustedScore,
       signals,
       ai,
-      reason: ai.reasoning,
+      reason: timingNote + ai.reasoning,
     };
   }
 
@@ -530,12 +555,30 @@ export class ScoringEngine {
       };
     }
 
+    const adjustedScore = finalScore - gates.scorePenalty;
+    const bandAfter = classifyEntryScore(adjustedScore);
+    if (bandAfter.kind !== 'strong' || bandAfter.side !== side) {
+      const tagStr = gates.timingTags.length ? gates.timingTags.join(',') : 'penalty';
+      return {
+        execute: false,
+        side,
+        finalScore,
+        signals,
+        reason: `Entry timing: ${tagStr} → score ${adjustedScore.toFixed(1)} (need strong ${side})`,
+        skipCause: 'entry_timing',
+      };
+    }
+
+    const timingNote =
+      gates.timingTags.length > 0 ? `[timing: ${gates.timingTags.join(',')}] ` : '';
+
     return {
       execute: true,
       side,
-      finalScore,
+      finalScore: adjustedScore,
       signals,
-      reason: side === 'LONG' ? 'Numeric long signal' : 'Numeric short signal',
+      reason:
+        timingNote + (side === 'LONG' ? 'Numeric long signal' : 'Numeric short signal'),
     };
   }
 }
