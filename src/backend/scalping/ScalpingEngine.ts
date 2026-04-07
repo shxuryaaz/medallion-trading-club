@@ -141,7 +141,10 @@ function lastKReturns(prices: number[], k: number): number[] {
   return out;
 }
 
-function tickNoiseGate(prices: number[]): { ok: true } | { ok: false; reason: string } {
+function tickNoiseGate(
+  prices: number[],
+  symbol?: string
+): { ok: true } | { ok: false; reason: string } {
   if (prices.length < NOISE_K + 1) return { ok: false, reason: 'noise_insufficient' };
   const returns = lastKReturns(prices, NOISE_K);
   if (returns.length < NOISE_K * 0.85) return { ok: false, reason: 'noise_insufficient' };
@@ -161,6 +164,9 @@ function tickNoiseGate(prices: number[]): { ok: true } | { ok: false; reason: st
   const consistency = Math.abs(signedSum) / returns.length;
   if (flips > FLIP_MAX) return { ok: false, reason: `noise_chop(flips=${flips})` };
   if (consistency < CONSISTENCY_MIN) {
+    if (symbol) {
+      console.log(`[SCALP][ALMOST] ${symbol} failed=noise consistency=${consistency.toFixed(2)}`);
+    }
     return { ok: false, reason: `noise_chop(consistency=${consistency.toFixed(2)})` };
   }
   return { ok: true };
@@ -324,8 +330,8 @@ const PULLBACK_W           = 20;
 const NOISE_K              = 28;
 const MICRO_NOISE_FLOOR    = 5e-7;
 const FLIP_MAX             = 14;
-const CONSISTENCY_MIN      = 0.1;
-const ENTRY_SCORE_MIN      = 60;
+const CONSISTENCY_MIN      = 0.08;
+const ENTRY_SCORE_MIN      = 55;
 const SCORE_SIZE_MIN       = 0.45;            // size scale at minimum qualifying score
 
 interface ScalpMarketContext {
@@ -491,7 +497,7 @@ export class ScalpingEngine {
         put({ decision: 'SKIP', score: 0, reason: shortenScalpReason(vol.reason), timestamp });
         continue;
       }
-      const noise = tickNoiseGate(prices);
+      const noise = tickNoiseGate(prices, symbol);
       if (noise.ok === false) {
         put({ decision: 'SKIP', score: 0, reason: shortenScalpReason(noise.reason), timestamp });
         continue;
@@ -503,7 +509,7 @@ export class ScalpingEngine {
         continue;
       }
 
-      const entry = this.evaluateEntry(prices, ctx);
+      const entry = this.evaluateEntry(symbol, prices, ctx);
       if (!entry.ok) {
         put({
           decision: 'SKIP',
@@ -598,7 +604,7 @@ export class ScalpingEngine {
       return { ...base, volShort, skipReason: vol.reason };
     }
 
-    const noise = tickNoiseGate(prices);
+    const noise = tickNoiseGate(prices, symbol);
     if (noise.ok === false) {
       const vp = tickReturnVolatility(prices, VOL_SHORT_RETURNS, VOL_LONG_RETURNS);
       volShort = vp?.shortVol ?? volShort;
@@ -611,7 +617,7 @@ export class ScalpingEngine {
       return { ...base, volShort, skipReason: 'htf_context_unavailable' };
     }
 
-    const entry = this.evaluateEntry(prices, ctx);
+    const entry = this.evaluateEntry(symbol, prices, ctx);
     volShort = tickReturnVolatility(prices, VOL_SHORT_RETURNS, VOL_LONG_RETURNS)?.shortVol ?? volShort;
 
     if (!entry.ok) {
@@ -845,7 +851,7 @@ export class ScalpingEngine {
         continue;
       }
 
-      const noise = tickNoiseGate(prices);
+      const noise = tickNoiseGate(prices, symbol);
       if (noise.ok === false) {
         this.addLog(`SKIP ${symbol} cause=${noise.reason}`);
         continue;
@@ -857,7 +863,7 @@ export class ScalpingEngine {
         continue;
       }
 
-      const entry = this.evaluateEntry(prices, ctx);
+      const entry = this.evaluateEntry(symbol, prices, ctx);
 
       if (!entry.ok) {
         this.addLog(`SKIP ${symbol} cause=${entry.reason}`);
@@ -878,7 +884,7 @@ export class ScalpingEngine {
 
   // ── Signal logic ──────────────────────────────────────────────────────────
 
-  private evaluateEntry(prices: number[], ctx: ScalpMarketContext): EntryEval {
+  private evaluateEntry(symbol: string, prices: number[], ctx: ScalpMarketContext): EntryEval {
     const ema9  = computeEMA(prices, 9);
     const ema21 = computeEMA(prices, 21);
     const rsiVal = computeRSI(prices, 7);
@@ -892,6 +898,8 @@ export class ScalpingEngine {
 
     const spread = Math.abs(ema9 - ema21) / ema21;
     if (spread < MIN_EMA_SPREAD_PCT) {
+      const spreadPct = `${(spread * 100).toFixed(4)}%`;
+      console.log(`[SCALP][ALMOST] ${symbol} failed=ema_spread spread=${spreadPct}`);
       return { ok: false, reason: `sideways_ema(spread=${(spread * 100).toFixed(4)}%)` };
     }
 
@@ -899,6 +907,8 @@ export class ScalpingEngine {
       const a = prices[prices.length - 1 - MIN_MOM_LOOKBACK];
       const mag = Math.abs(last - a) / a;
       if (mag < MIN_MOM_PCT) {
+        const momMag = `${(mag * 100).toFixed(4)}%`;
+        console.log(`[SCALP][ALMOST] ${symbol} failed=momentum mag=${momMag}`);
         return { ok: false, reason: `mom_weak(mag=${(mag * 100).toFixed(4)}%)` };
       }
     }
@@ -945,6 +955,12 @@ export class ScalpingEngine {
         ema21,
       });
       if (score < ENTRY_SCORE_MIN) {
+        if (score >= 50 && score < ENTRY_SCORE_MIN) {
+          console.log(
+            `[SCALP][ALMOST] ${symbol} score=${score.toFixed(1)} ` +
+              `reason=below_threshold`
+          );
+        }
         return { ok: false, reason: `score_below_${ENTRY_SCORE_MIN}(${score})` };
       }
 
@@ -984,6 +1000,12 @@ export class ScalpingEngine {
         ema21,
       });
       if (score < ENTRY_SCORE_MIN) {
+        if (score >= 50 && score < ENTRY_SCORE_MIN) {
+          console.log(
+            `[SCALP][ALMOST] ${symbol} score=${score.toFixed(1)} ` +
+              `reason=below_threshold`
+          );
+        }
         return { ok: false, reason: `score_below_${ENTRY_SCORE_MIN}(${score})` };
       }
 
