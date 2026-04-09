@@ -44,6 +44,41 @@ interface ScalpPerf {
   losses?: number;
 }
 
+function closedScalpNet(trade: { status?: string; pnl?: number; netPnl?: number }): number | null {
+  if (trade.status !== "CLOSED") return null;
+  if (typeof trade.netPnl === "number") return trade.netPnl;
+  if (typeof trade.pnl === "number") return trade.pnl;
+  return null;
+}
+
+/** Closed scalp rows only — same list as “Scalp trades”; one source for this panel. */
+function scalpStatsFromTrades(trades: any[]): ScalpPerf | null {
+  const closed = trades.filter((t) => closedScalpNet(t) != null);
+  const net = (t: any) => closedScalpNet(t) as number;
+  const wins = closed.filter((t) => net(t) > 0);
+  const losses = closed.filter((t) => net(t) < 0);
+  const n = closed.length;
+  if (n === 0) return null;
+  const avgProfit = wins.length > 0 ? wins.reduce((s, t) => s + net(t), 0) / wins.length : 0;
+  const avgLoss = losses.length > 0 ? losses.reduce((s, t) => s + net(t), 0) / losses.length : 0;
+  const sumWins = wins.reduce((s, t) => s + net(t), 0);
+  const sumLosses = losses.reduce((s, t) => s + net(t), 0);
+  const profitFactor =
+    losses.length === 0 ? (sumWins > 0 ? null : 0) : sumWins / Math.abs(sumLosses);
+  const avgWinToAvgLoss =
+    wins.length > 0 && losses.length > 0 && avgLoss !== 0 ? avgProfit / Math.abs(avgLoss) : null;
+  return {
+    closedTrades: n,
+    wins: wins.length,
+    losses: losses.length,
+    winRate: wins.length / n,
+    avgProfit,
+    avgLoss,
+    profitFactor,
+    avgWinToAvgLoss,
+  };
+}
+
 interface ScalpDashboardProps {
   snapshot: ScalpSnapshot | null;
   performance: ScalpPerf | null;
@@ -91,6 +126,15 @@ export const ScalpDashboard: React.FC<ScalpDashboardProps> = ({
   positions,
 }) => {
   const scalpTrades = trades.filter((t) => t.source === "scalp");
+  const perfFromApi = performance;
+  const perfFromHistory = scalpStatsFromTrades(scalpTrades);
+  const displayPerformance: ScalpPerf | null = (() => {
+    const apiClosed = perfFromApi?.closedTrades ?? 0;
+    const histClosed = perfFromHistory?.closedTrades ?? 0;
+    if (!perfFromApi) return perfFromHistory;
+    if (apiClosed === 0 && histClosed > 0) return perfFromHistory;
+    return perfFromApi;
+  })();
 
   const metricsForScalpTrade = (trade: any) => {
     const pos =
@@ -102,9 +146,11 @@ export const ScalpDashboard: React.FC<ScalpDashboardProps> = ({
     const pnl =
       pos && typeof pos.unrealizedPnl === "number"
         ? pos.unrealizedPnl
-        : typeof trade.pnl === "number"
-          ? trade.pnl
-          : null;
+        : trade.status === "CLOSED" && typeof trade.netPnl === "number"
+          ? trade.netPnl
+          : typeof trade.pnl === "number"
+            ? trade.pnl
+            : null;
     const score = trade.scalpEntryQuality?.score;
     return { cur, pnl, score };
   };
@@ -344,34 +390,34 @@ export const ScalpDashboard: React.FC<ScalpDashboardProps> = ({
             <div className="border border-white/10 rounded-lg px-3 py-3">
               <div className="text-[10px] text-white/40 uppercase mb-1">Win rate</div>
               <div className="font-mono text-white">
-                {performance && performance.closedTrades > 0
-                  ? `${(performance.winRate * 100).toFixed(1)}%`
+                {displayPerformance && displayPerformance.closedTrades > 0
+                  ? `${(displayPerformance.winRate * 100).toFixed(1)}%`
                   : "—"}
               </div>
-              <div className="text-[10px] text-white/30 mt-0.5">{performance?.closedTrades ?? 0} closed</div>
+              <div className="text-[10px] text-white/30 mt-0.5">{displayPerformance?.closedTrades ?? 0} closed</div>
             </div>
             <div className="border border-white/10 rounded-lg px-3 py-3">
               <div className="text-[10px] text-white/40 uppercase mb-1">Profit factor</div>
               <div className="font-mono text-white">
-                {performance?.profitFactor == null ? "—" : performance.profitFactor.toFixed(2)}
+                {displayPerformance?.profitFactor == null ? "—" : displayPerformance.profitFactor.toFixed(2)}
               </div>
             </div>
             <div className="border border-white/10 rounded-lg px-3 py-3">
               <div className="text-[10px] text-white/40 uppercase mb-1">Avg win</div>
               <div className="font-mono text-emerald-400">
-                {performance && (performance.wins ?? 0) > 0 ? `+${performance.avgProfit.toFixed(2)}` : "—"}
+                {displayPerformance && (displayPerformance.wins ?? 0) > 0 ? `+${displayPerformance.avgProfit.toFixed(2)}` : "—"}
               </div>
             </div>
             <div className="border border-white/10 rounded-lg px-3 py-3">
               <div className="text-[10px] text-white/40 uppercase mb-1">Avg loss</div>
               <div className="font-mono text-red-400">
-                {performance && (performance.losses ?? 0) > 0 ? performance.avgLoss.toFixed(2) : "—"}
+                {displayPerformance && (displayPerformance.losses ?? 0) > 0 ? displayPerformance.avgLoss.toFixed(2) : "—"}
               </div>
             </div>
           </div>
-          {performance?.avgWinToAvgLoss != null && (
+          {displayPerformance?.avgWinToAvgLoss != null && (
             <div className="mt-2 text-[10px] font-mono text-white/40">
-              Avg win / |avg loss|: {performance.avgWinToAvgLoss.toFixed(2)}
+              Avg win / |avg loss|: {displayPerformance.avgWinToAvgLoss.toFixed(2)}
             </div>
           )}
         </section>

@@ -22,6 +22,8 @@ const SYMBOL_OPTIONS = [
 ] as const;
 
 export default function App() {
+  const SHOW_SETTINGS_IN_MAIN_UI = false;
+  const SHOW_BELL_IN_MAIN_UI = false;
   const [status, setStatus] = useState<any>(null);
   const [ohlcv, setOhlcv] = useState<any[]>([]);
   const [insights, setInsights] = useState<any>(null);
@@ -97,15 +99,6 @@ export default function App() {
     }
   };
 
-  const handleStop = async () => {
-    try {
-      await axios.post(`${API_BASE_URL}/api/stop`);
-      fetchStatus();
-    } catch (err) {
-      console.error("Error stopping trading system:", err);
-    }
-  };
-
   const safeStatus = status ?? {
     isRunning: false,
     balance: 0,
@@ -132,7 +125,7 @@ export default function App() {
     { view: "dashboard" as const, icon: Shield, label: "Trade" },
     { view: "activity" as const, icon: Activity, label: "Activity" },
     { view: "settings" as const, icon: Settings, label: "Settings" },
-  ];
+  ].filter((item) => SHOW_SETTINGS_IN_MAIN_UI || item.view !== "settings");
 
   return (
     <main className="min-h-dvh overflow-x-hidden bg-black text-white selection:bg-white selection:text-black font-sans">
@@ -158,7 +151,9 @@ export default function App() {
               onClick={() => setActiveView(view)}
             />
           ))}
-          <Bell className="w-6 h-6 text-white/40 hover:text-white/60 transition-colors cursor-pointer" />
+          {SHOW_BELL_IN_MAIN_UI && (
+            <Bell className="w-6 h-6 text-white/40 hover:text-white/60 transition-colors cursor-pointer" />
+          )}
         </div>
 
         <div className="mt-auto">
@@ -266,7 +261,6 @@ export default function App() {
                     isRunning={safeStatus.isRunning}
                     logs={safeStatus.logs}
                     onStart={handleStart}
-                    onStop={handleStop}
                   />
                 </div>
                 <div>
