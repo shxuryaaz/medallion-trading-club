@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import { PortfolioManager } from './backend/portfolio/PortfolioManager.ts';
 import { TradingSystem } from './backend/TradingSystem.ts';
 import { ScalpingEngine } from './backend/scalping/ScalpingEngine.ts';
+import { StateStore, loadState } from './backend/storage/StateStore.ts';
 import { WebSocketManager } from './backend/data/WebSocketManager.ts';
 import { DataLayer } from './backend/DataLayer.ts';
 import { ScoringEngine } from './backend/Engine.ts';
@@ -26,10 +27,18 @@ async function startServer() {
   app.use(express.json());
 
   // ── Engine setup ────────────────────────────────────────────────────────────
-  const portfolio   = new PortfolioManager();
+  const persisted   = await loadState();
+  const portfolio   = new PortfolioManager(persisted.balance);
   const wsManager   = WebSocketManager.getInstance();
-  const swingEngine = new TradingSystem(portfolio);
-  const scalpEngine = new ScalpingEngine(portfolio, wsManager);
+  const swingEngine = new TradingSystem(portfolio, persisted.swing);
+  const scalpEngine = new ScalpingEngine(portfolio, wsManager, persisted.scalp);
+
+  StateStore.registerSnapshotBuilder(() => ({
+    balance: portfolio.getBalance(),
+    swing: swingEngine.getPersistSnapshot(),
+    scalp: scalpEngine.getPersistSnapshot(),
+  }));
+  StateStore.scheduleSave();
 
   // ── Routes ──────────────────────────────────────────────────────────────────
 

@@ -23,9 +23,8 @@ export class PortfolioManager {
   // symbol → list of open risk entries (one per open trade on that symbol, any engine)
   private registry = new Map<string, RiskEntry[]>();
 
-  constructor() {
-    const snap = StateStore.loadPortfolio();
-    this.balance = snap?.balance ?? 10_000;
+  constructor(initialBalance: number) {
+    this.balance = Number.isFinite(initialBalance) ? initialBalance : 10_000;
     console.log(`[Portfolio] Initialized. Balance: ${this.balance.toFixed(2)}`);
   }
 
@@ -83,7 +82,7 @@ export class PortfolioManager {
     }
     // Update balance — this is the single place balance is mutated
     this.balance += pnl;
-    StateStore.savePortfolio({ balance: this.balance });
+    StateStore.scheduleSave();
   }
 
   // ── Reads ─────────────────────────────────────────────────────────────────

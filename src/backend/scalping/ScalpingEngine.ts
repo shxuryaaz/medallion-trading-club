@@ -6,7 +6,7 @@ import { computeATR } from '../Engine';
 import type { TradeLog } from '../types';
 import { PortfolioManager } from '../portfolio/PortfolioManager';
 import { WebSocketManager } from '../data/WebSocketManager';
-import { StateStore } from '../persistence/StateStore';
+import { StateStore, type EngineStateSnapshot } from '../persistence/StateStore';
 import { closedTradeNetAmount, entryExitFees, feeOnNotional, minTpDistanceForFees } from '../fees';
 import { DEFAULT_WATCHLIST_PANEL_SYMBOLS } from '../../constants/watchlistPanel.ts';
 
@@ -404,11 +404,15 @@ export class ScalpingEngine {
     return MIN_BUFFER_TICKS_COLD;
   }
 
-  constructor(portfolio: PortfolioManager, ws: WebSocketManager) {
+  constructor(
+    portfolio: PortfolioManager,
+    ws: WebSocketManager,
+    initialSnapshot?: EngineStateSnapshot | null
+  ) {
     this.portfolio = portfolio;
     this.ws        = ws;
 
-    const snap = StateStore.load(ENGINE_ID);
+    const snap = initialSnapshot ?? null;
     if (snap) {
       this.activePositions    = snap.activePositions ?? [];
       this.tradeHistory       = snap.tradeHistory ?? [];
@@ -1182,13 +1186,17 @@ export class ScalpingEngine {
   }
 
   private persistState(): void {
-    StateStore.save(ENGINE_ID, {
-      tradeHistory:        this.tradeHistory,
-      activePositions:     this.activePositions,
-      lossStreakPauseUntil: this.lossStreakPauseUntil > Date.now()
-        ? this.lossStreakPauseUntil
-        : undefined,
-    });
+    StateStore.scheduleSave();
+  }
+
+  /** Full engine slice for unified `state.json` persistence. */
+  getPersistSnapshot(): EngineStateSnapshot {
+    return {
+      tradeHistory: this.tradeHistory,
+      activePositions: this.activePositions,
+      lossStreakPauseUntil:
+        this.lossStreakPauseUntil > Date.now() ? this.lossStreakPauseUntil : undefined,
+    };
   }
 
   private addLog(msg: string): void {

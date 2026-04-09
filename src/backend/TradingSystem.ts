@@ -10,7 +10,7 @@ import {
   type AiEnrichmentContext,
 } from './Engine';
 import type { TradeLog } from './types';
-import { StateStore } from './persistence/StateStore';
+import { StateStore, type EngineStateSnapshot } from './persistence/StateStore';
 import { PortfolioManager } from './portfolio/PortfolioManager';
 import { closedTradeNetAmount, entryExitFees, minTpDistanceForFees } from './fees';
 
@@ -83,10 +83,10 @@ export class TradingSystem {
   private symbolLastClosedAt = new Map<string, number>();
   private lossStreakPauseUntil = 0;
 
-  constructor(portfolio: PortfolioManager) {
+  constructor(portfolio: PortfolioManager, initialSnapshot?: EngineStateSnapshot | null) {
     this.portfolio = portfolio;
 
-    const snap = StateStore.load(ENGINE_ID);
+    const snap = initialSnapshot ?? null;
     if (snap) {
       this.tradeHistory = snap.tradeHistory;
       this.activePositions = snap.activePositions
@@ -145,12 +145,17 @@ export class TradingSystem {
   }
 
   private persistState() {
-    StateStore.save(ENGINE_ID, {
+    StateStore.scheduleSave();
+  }
+
+  /** Full engine slice for unified `state.json` persistence. */
+  getPersistSnapshot(): EngineStateSnapshot {
+    return {
       tradeHistory: this.tradeHistory,
       activePositions: this.activePositions,
       lossStreakPauseUntil:
         this.lossStreakPauseUntil > Date.now() ? this.lossStreakPauseUntil : undefined,
-    });
+    };
   }
 
   private addLog(msg: string) {
