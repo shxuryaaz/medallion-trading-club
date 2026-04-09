@@ -497,11 +497,8 @@ export class ScalpingEngine {
         put({ decision: 'SKIP', score: 0, reason: shortenScalpReason(vol.reason), timestamp });
         continue;
       }
-      const noise = tickNoiseGate(prices, symbol);
-      if (noise.ok === false) {
-        put({ decision: 'SKIP', score: 0, reason: shortenScalpReason(noise.reason), timestamp });
-        continue;
-      }
+      // Noise is advisory only (score-side), not a hard gate.
+      tickNoiseGate(prices, symbol);
 
       const ctx = await this.ensureScalpMarketContext(symbol);
       if (ctx == null) {
@@ -604,12 +601,8 @@ export class ScalpingEngine {
       return { ...base, volShort, skipReason: vol.reason };
     }
 
-    const noise = tickNoiseGate(prices, symbol);
-    if (noise.ok === false) {
-      const vp = tickReturnVolatility(prices, VOL_SHORT_RETURNS, VOL_LONG_RETURNS);
-      volShort = vp?.shortVol ?? volShort;
-      return { ...base, volShort, skipReason: noise.reason };
-    }
+    // Noise is advisory only (score-side), not a hard gate.
+    tickNoiseGate(prices, symbol);
 
     if (ctx == null) {
       const vp = tickReturnVolatility(prices, VOL_SHORT_RETURNS, VOL_LONG_RETURNS);
@@ -851,11 +844,8 @@ export class ScalpingEngine {
         continue;
       }
 
-      const noise = tickNoiseGate(prices, symbol);
-      if (noise.ok === false) {
-        this.addLog(`SKIP ${symbol} cause=${noise.reason}`);
-        continue;
-      }
+      // Noise is advisory only (score-side), not a hard gate.
+      tickNoiseGate(prices, symbol);
 
       const ctx = await this.ensureScalpMarketContext(symbol);
       if (ctx == null) {
@@ -885,144 +875,102 @@ export class ScalpingEngine {
   // ── Signal logic ──────────────────────────────────────────────────────────
 
   private evaluateEntry(symbol: string, prices: number[], ctx: ScalpMarketContext): EntryEval {
-    const ema9  = computeEMA(prices, 9);
-    const ema21 = computeEMA(prices, 21);
-    const rsiVal = computeRSI(prices, 7);
-    const mom    = microMomentum(prices, MIN_MOM_LOOKBACK);
-    const last   = prices[prices.length - 1];
-
     const volPack = tickReturnVolatility(prices, VOL_SHORT_RETURNS, VOL_LONG_RETURNS);
     const volShort = volPack?.shortVol ?? 0;
+    const last = prices[prices.length - 1];
 
-    if (rsiVal == null) return { ok: false, reason: 'rsi_insufficient' };
+    // ── STRUCTURE layer (1m candles) ───────────────────────────────────────
+    const candles = ctx.ohlcv;
+    const closes = candles.map((c) => c.close);
+    if (closes.length < 30) return { ok: false, reason: 'structure_insufficient' };
 
-    const spread = Math.abs(ema9 - ema21) / ema21;
-    if (spread < MIN_EMA_SPREAD_PCT) {
-      const spreadPct = `${(spread * 100).toFixed(4)}%`;
-      console.log(`[SCALP][ALMOST] ${symbol} failed=ema_spread spread=${spreadPct}`);
-      return { ok: false, reason: `sideways_ema(spread=${(spread * 100).toFixed(4)}%)` };
-    }
+    const cEma9 = computeEMA(closes, 9);
+    const cEma21 = computeEMA(closes, 21);
+    const cRsi = computeRSI(closes, 7);
+    if (cRsi == null) return { ok: false, reason: 'rsi_insufficient' };
+    const prevClose = closes[closes.length - 2];
+    const candleMom = prevClose > 0 ? (closes[closes.length - 1] - prevClose) / prevClose : 0;
 
-    if (prices.length >= MIN_MOM_LOOKBACK + 1) {
-      const a = prices[prices.length - 1 - MIN_MOM_LOOKBACK];
-      const mag = Math.abs(last - a) / a;
-      if (mag < MIN_MOM_PCT) {
-        const momMag = `${(mag * 100).toFixed(4)}%`;
-        console.log(`[SCALP][ALMOST] ${symbol} failed=momentum mag=${momMag}`);
-        return { ok: false, reason: `mom_weak(mag=${(mag * 100).toFixed(4)}%)` };
-      }
-    }
+    let structureBias: 'LONG' | 'SHORT' | null = null;
+    if (cEma9 > cEma21 && cRsi > 50 && candleMom > 0) structureBias = 'LONG';
+    else if (cEma9 < cEma21 && cRsi < 50 && candleMom < 0) structureBias = 'SHORT';
 
-    const longAlign =
-      (ema9 > ema21 ? 1 : 0) + (rsiVal > MIN_RSI_LONG ? 1 : 0) + (mom === 'up' ? 1 : 0);
-    const shortAlign =
-      (ema9 < ema21 ? 1 : 0) + (rsiVal < MAX_RSI_SHORT ? 1 : 0) + (mom === 'down' ? 1 : 0);
+    console.log(
+      `[SCALP][STRUCTURE] ${symbol} ${structureBias ?? 'NONE'} ` +
+        `ema=${cEma9.toFixed(4)}/${cEma21.toFixed(4)} rsi=${cRsi.toFixed(1)} mom=${(candleMom * 100).toFixed(3)}%`
+    );
 
-    let primary: 'LONG' | 'SHORT' | null = null;
-    if (longAlign >= 2 && shortAlign >= 2) {
-      if (longAlign > shortAlign) primary = 'LONG';
-      else if (shortAlign > longAlign) primary = 'SHORT';
-      else primary = mom === 'down' ? 'SHORT' : 'LONG';
-    } else if (longAlign >= 2) {
-      primary = 'LONG';
-    } else if (shortAlign >= 2) {
-      primary = 'SHORT';
-    }
-
-    if (primary === 'LONG') {
-      if (!ctx.allowsLong) {
-        return { ok: false, reason: 'htf_not_uptrend' };
-      }
-      if (rsiVal >= MAX_RSI_LONG_ENTRY) {
-        return { ok: false, reason: `overextended_long(rsi=${rsiVal.toFixed(1)})` };
-      }
-      if (last > ema21 * (1 + MAX_STRETCH_FROM_EMA)) {
-        return { ok: false, reason: 'overextended_long(vs_ema21)' };
-      }
-
-      const pb = pullbackOkLong(prices);
-      if (pb.ok === false) return { ok: false, reason: pb.reason };
-
-      const ac = tickAcceleration(prices, ACCEL_BLOCK_N, 'LONG');
-      if (ac.ok === false) return { ok: false, reason: ac.reason };
-
-      const score = entryQualityScore({
-        accelRatio: ac.ratio,
-        volShort,
-        tickSpread: spread,
-        htfSpreadPct: ctx.htfSpreadPct,
-        last,
-        ema21,
-      });
-      if (score < ENTRY_SCORE_MIN) {
-        if (score >= 50 && score < ENTRY_SCORE_MIN) {
-          console.log(
-            `[SCALP][ALMOST] ${symbol} score=${score.toFixed(1)} ` +
-              `reason=below_threshold`
-          );
-        }
-        return { ok: false, reason: `score_below_${ENTRY_SCORE_MIN}(${score})` };
-      }
-
+    if (structureBias == null) {
       return {
-        ok: true,
-        side: 'LONG',
-        score,
-        momentumStrength: ac.strengthRecent,
-        volShort,
-        reason: `LONG align=${longAlign}/3 rsi=${rsiVal.toFixed(1)} spread=${(spread * 100).toFixed(3)}% score=${score}`,
+        ok: false,
+        reason: `no_signal(structure ema=${cEma9 > cEma21 ? 'bull' : 'bear'} rsi=${cRsi.toFixed(1)} mom=${(candleMom * 100).toFixed(3)}%)`,
       };
     }
 
-    if (primary === 'SHORT') {
-      if (!ctx.allowsShort) {
-        return { ok: false, reason: 'htf_not_downtrend' };
-      }
-      if (rsiVal <= MIN_RSI_SHORT_ENTRY) {
-        return { ok: false, reason: `overextended_short(rsi=${rsiVal.toFixed(1)})` };
-      }
-      if (last < ema21 * (1 - MAX_STRETCH_FROM_EMA)) {
-        return { ok: false, reason: 'overextended_short(vs_ema21)' };
-      }
+    // ── TRIGGER layer (ticks) ──────────────────────────────────────────────
+    if (prices.length < 10) return { ok: false, reason: 'trigger_insufficient' };
+    const t = prices;
+    const a = t[t.length - 1];
+    const b = t[t.length - 2];
+    const c = t[t.length - 3];
+    const d = t[t.length - 4];
+    const recentBand = t.slice(-10, -3);
+    const recentHi = Math.max(...recentBand);
+    const recentLo = Math.min(...recentBand);
+    const pullbackLong = c <= d && c <= recentHi * (1 - 0.00005);
+    const pullbackShort = c >= d && c >= recentLo * (1 + 0.00005);
+    const microTrendUp = a > b && b > c;
+    const microTrendDown = a < b && b < c;
 
-      const pb = pullbackOkShort(prices);
-      if (pb.ok === false) return { ok: false, reason: pb.reason };
+    if (structureBias === 'LONG' && !(pullbackLong && microTrendUp)) {
+      return { ok: false, reason: 'trigger_not_confirmed_long' };
+    }
+    if (structureBias === 'SHORT' && !(pullbackShort && microTrendDown)) {
+      return { ok: false, reason: 'trigger_not_confirmed_short' };
+    }
+    console.log(
+      `[SCALP][TRIGGER] ${symbol} ${
+        structureBias === 'LONG' ? 'micro_up_confirmed' : 'micro_down_confirmed'
+      }`
+    );
 
-      const ac = tickAcceleration(prices, ACCEL_BLOCK_N, 'SHORT');
-      if (ac.ok === false) return { ok: false, reason: ac.reason };
+    // Soft filters / penalties
+    const spread = Math.abs(cEma9 - cEma21) / Math.max(Math.abs(cEma21), 1e-12);
+    let penalty = 0;
+    if (spread < MIN_EMA_SPREAD_PCT) penalty += 6;
+    if (structureBias === 'LONG' && !ctx.allowsLong) penalty += 10;
+    if (structureBias === 'SHORT' && !ctx.allowsShort) penalty += 10;
 
-      const score = entryQualityScore({
-        accelRatio: ac.ratio,
-        volShort,
-        tickSpread: spread,
-        htfSpreadPct: ctx.htfSpreadPct,
-        last,
-        ema21,
-      });
-      if (score < ENTRY_SCORE_MIN) {
-        if (score >= 50 && score < ENTRY_SCORE_MIN) {
-          console.log(
-            `[SCALP][ALMOST] ${symbol} score=${score.toFixed(1)} ` +
-              `reason=below_threshold`
-          );
-        }
-        return { ok: false, reason: `score_below_${ENTRY_SCORE_MIN}(${score})` };
-      }
-
-      return {
-        ok: true,
-        side: 'SHORT',
-        score,
-        momentumStrength: ac.strengthRecent,
-        volShort,
-        reason: `SHORT align=${shortAlign}/3 rsi=${rsiVal.toFixed(1)} spread=${(spread * 100).toFixed(3)}% score=${score}`,
-      };
+    const returns = lastKReturns(prices, NOISE_K);
+    if (returns.length > 0) {
+      const signedSum = returns.reduce((s, r) => s + (Math.abs(r) > MICRO_NOISE_FLOOR ? Math.sign(r) : 0), 0);
+      const consistency = Math.abs(signedSum) / returns.length;
+      if (consistency < CONSISTENCY_MIN) penalty += 4;
     }
 
-    const dir = ema9 > ema21 ? 'bullish' : 'bearish';
+    const accelRatio = 1 + Math.min(Math.abs(candleMom) / Math.max(MIN_MOM_PCT, 1e-12), 1);
+    let score = entryQualityScore({
+      accelRatio,
+      volShort,
+      tickSpread: spread,
+      htfSpreadPct: ctx.htfSpreadPct,
+      last,
+      ema21: cEma21,
+    });
+    score = Math.max(0, Math.round(score - penalty));
+
+    if (score < ENTRY_SCORE_MIN) {
+      return { ok: false, reason: `score_below_${ENTRY_SCORE_MIN}(${score})` };
+    }
+
+    console.log(`[SCALP][ENTRY] ${symbol} ${structureBias} score=${score}`);
     return {
-      ok: false,
-      reason: `no_signal(${dir} rsi=${rsiVal.toFixed(1)} mom=${mom} longAlign=${longAlign} shortAlign=${shortAlign})`,
+      ok: true,
+      side: structureBias,
+      score,
+      momentumStrength: Math.abs(candleMom),
+      volShort,
+      reason: `${structureBias} structure+trigger score=${score} penalty=${penalty}`,
     };
   }
 
