@@ -320,8 +320,8 @@ const ATR_STOP_MULT        = 1.25;
 const SL_MIN_PCT           = 0.0025;          // 0.25% floor on stop distance
 const SL_MAX_PCT           = 0.005;           // 0.50% cap
 const SL_TIGHTEN_MULT      = 0.9;             // slightly tighter stop vs raw ATR clamp
-const TP_RR                = 1.5;             // baseline RR on SL distance
-const TP_MIN_R_MULT        = 1.2;              // TP distance >= this × SL distance
+const TP_RR                = 2.2;             // baseline RR on SL distance
+const TP_MIN_R_MULT        = 1.5;             // TP distance >= this × SL distance
 
 // Entry quality — acceleration, pullback, noise, score, sizing
 const ACCEL_BLOCK_N        = 5;
@@ -331,7 +331,7 @@ const NOISE_K              = 28;
 const MICRO_NOISE_FLOOR    = 5e-7;
 const FLIP_MAX             = 14;
 const CONSISTENCY_MIN      = 0.08;
-const ENTRY_SCORE_MIN      = 40;
+const ENTRY_SCORE_MIN      = 35;
 const SCORE_SIZE_MIN       = 0.45;            // size scale at minimum qualifying score
 
 interface ScalpMarketContext {
@@ -921,6 +921,7 @@ export class ScalpingEngine {
     if (structureBias === 'SHORT' && !microTrendDown) {
       return { ok: false, reason: 'trigger_not_confirmed_short' };
     }
+    const triggerConfirmed = structureBias === 'LONG' ? microTrendUp : microTrendDown;
     console.log(
       `[SCALP][TRIGGER] ${symbol} ${
         structureBias === 'LONG' ? 'micro_up_confirmed' : 'micro_down_confirmed'
@@ -951,9 +952,12 @@ export class ScalpingEngine {
       ema21: cEma21,
     });
     score = Math.max(0, Math.round(score - penalty));
+    if (structureBias != null && triggerConfirmed) {
+      score = Math.min(100, score + 5);
+    }
 
-    const hasTrigger = structureBias === 'LONG' ? microTrendUp : microTrendDown;
-    const overrideAllowed = structureBias != null && hasTrigger && score >= 40;
+    const hasTrigger = triggerConfirmed;
+    const overrideAllowed = structureBias != null && hasTrigger && score >= ENTRY_SCORE_MIN;
     if (score < ENTRY_SCORE_MIN && !overrideAllowed) {
       return { ok: false, reason: `score_below_${ENTRY_SCORE_MIN}(${score})` };
     }
@@ -1012,9 +1016,16 @@ export class ScalpingEngine {
     // Fee-aware: net price move to TP must exceed stop distance (same units as SL risk)
     const roundTripFees = feeOnNotional(price, amount) + feeOnNotional(tp, amount);
     const netTpMovePerUnit = tpDist - roundTripFees / amount;
-    if (netTpMovePerUnit <= slDist) {
+    if (netTpMovePerUnit <= 0) {
       this.addLog(
-        `SKIP ${symbol} ${side} cause=fee_rr(netTPmove=${netTpMovePerUnit.toFixed(6)} need>${slDist.toFixed(6)} ` +
+        `SKIP ${symbol} ${side} cause=negative_edge(netTPmove=${netTpMovePerUnit.toFixed(6)} ` +
+          `tpDist=${tpDist.toFixed(6)} fees/amt=${(roundTripFees / amount).toFixed(6)})`
+      );
+      return;
+    }
+    if (netTpMovePerUnit <= slDist * 0.6) {
+      this.addLog(
+        `SKIP ${symbol} ${side} cause=fee_rr(netTPmove=${netTpMovePerUnit.toFixed(6)} need>${(slDist * 0.6).toFixed(6)} ` +
           `tpDist=${tpDist.toFixed(6)} fees/amt=${(roundTripFees / amount).toFixed(6)})`
       );
       return;
