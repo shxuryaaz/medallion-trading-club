@@ -331,7 +331,7 @@ const NOISE_K              = 28;
 const MICRO_NOISE_FLOOR    = 5e-7;
 const FLIP_MAX             = 14;
 const CONSISTENCY_MIN      = 0.08;
-const ENTRY_SCORE_MIN      = 55;
+const ENTRY_SCORE_MIN      = 40;
 const SCORE_SIZE_MIN       = 0.45;            // size scale at minimum qualifying score
 
 interface ScalpMarketContext {
@@ -908,24 +908,17 @@ export class ScalpingEngine {
     }
 
     // ── TRIGGER layer (ticks) ──────────────────────────────────────────────
-    if (prices.length < 10) return { ok: false, reason: 'trigger_insufficient' };
+    if (prices.length < 2) return { ok: false, reason: 'trigger_insufficient' };
     const t = prices;
     const a = t[t.length - 1];
     const b = t[t.length - 2];
-    const c = t[t.length - 3];
-    const d = t[t.length - 4];
-    const recentBand = t.slice(-10, -3);
-    const recentHi = Math.max(...recentBand);
-    const recentLo = Math.min(...recentBand);
-    const pullbackLong = c <= d && c <= recentHi * (1 - 0.00005);
-    const pullbackShort = c >= d && c >= recentLo * (1 + 0.00005);
-    const microTrendUp = a > b && b > c;
-    const microTrendDown = a < b && b < c;
+    const microTrendUp = a > b;
+    const microTrendDown = a < b;
 
-    if (structureBias === 'LONG' && !(pullbackLong && microTrendUp)) {
+    if (structureBias === 'LONG' && !microTrendUp) {
       return { ok: false, reason: 'trigger_not_confirmed_long' };
     }
-    if (structureBias === 'SHORT' && !(pullbackShort && microTrendDown)) {
+    if (structureBias === 'SHORT' && !microTrendDown) {
       return { ok: false, reason: 'trigger_not_confirmed_short' };
     }
     console.log(
@@ -945,7 +938,7 @@ export class ScalpingEngine {
     if (returns.length > 0) {
       const signedSum = returns.reduce((s, r) => s + (Math.abs(r) > MICRO_NOISE_FLOOR ? Math.sign(r) : 0), 0);
       const consistency = Math.abs(signedSum) / returns.length;
-      if (consistency < CONSISTENCY_MIN) penalty += 4;
+      if (consistency < CONSISTENCY_MIN) penalty += 5;
     }
 
     const accelRatio = 1 + Math.min(Math.abs(candleMom) / Math.max(MIN_MOM_PCT, 1e-12), 1);
@@ -959,7 +952,9 @@ export class ScalpingEngine {
     });
     score = Math.max(0, Math.round(score - penalty));
 
-    if (score < ENTRY_SCORE_MIN) {
+    const hasTrigger = structureBias === 'LONG' ? microTrendUp : microTrendDown;
+    const overrideAllowed = structureBias != null && hasTrigger && score >= 40;
+    if (score < ENTRY_SCORE_MIN && !overrideAllowed) {
       return { ok: false, reason: `score_below_${ENTRY_SCORE_MIN}(${score})` };
     }
 
