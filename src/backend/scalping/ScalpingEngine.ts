@@ -894,18 +894,28 @@ export class ScalpingEngine {
     let structureBias: 'LONG' | 'SHORT' | null = null;
     if (cEma9 > cEma21 && cRsi > 50 && candleMom > 0) structureBias = 'LONG';
     else if (cEma9 < cEma21 && cRsi < 50 && candleMom < 0) structureBias = 'SHORT';
+    const nearEma9 = Math.abs(last - cEma9) / Math.max(Math.abs(cEma9), 1e-12) <= MAX_STRETCH_FROM_EMA;
+    const nearEma21 = Math.abs(last - cEma21) / Math.max(Math.abs(cEma21), 1e-12) <= MAX_STRETCH_FROM_EMA;
+    const pullbackLongCandidate =
+      cEma9 > cEma21 &&
+      cRsi > 48 &&
+      candleMom < 0 &&
+      candleMom > -0.003 &&
+      (nearEma9 || nearEma21);
+    const isPullbackEntry = structureBias == null && pullbackLongCandidate;
 
     console.log(
       `[SCALP][STRUCTURE] ${symbol} ${structureBias ?? 'NONE'} ` +
         `ema=${cEma9.toFixed(4)}/${cEma21.toFixed(4)} rsi=${cRsi.toFixed(1)} mom=${(candleMom * 100).toFixed(3)}%`
     );
 
-    if (structureBias == null) {
+    if (structureBias == null && !isPullbackEntry) {
       return {
         ok: false,
         reason: `no_signal(structure ema=${cEma9 > cEma21 ? 'bull' : 'bear'} rsi=${cRsi.toFixed(1)} mom=${(candleMom * 100).toFixed(3)}%)`,
       };
     }
+    if (isPullbackEntry) structureBias = 'LONG';
 
     // ── TRIGGER layer (ticks) ──────────────────────────────────────────────
     if (prices.length < 2) return { ok: false, reason: 'trigger_insufficient' };
@@ -915,16 +925,26 @@ export class ScalpingEngine {
     const microTrendUp = a > b;
     const microTrendDown = a < b;
 
-    if (structureBias === 'LONG' && !microTrendUp) {
+    const pullbackTrigger = microTrendUp; // small bounce confirmation after pullback
+    if (isPullbackEntry && !pullbackTrigger) {
+      return { ok: false, reason: 'pullback_trigger_not_confirmed' };
+    }
+    if (!isPullbackEntry && structureBias === 'LONG' && !microTrendUp) {
       return { ok: false, reason: 'trigger_not_confirmed_long' };
     }
-    if (structureBias === 'SHORT' && !microTrendDown) {
+    if (!isPullbackEntry && structureBias === 'SHORT' && !microTrendDown) {
       return { ok: false, reason: 'trigger_not_confirmed_short' };
     }
-    const triggerConfirmed = structureBias === 'LONG' ? microTrendUp : microTrendDown;
+    const triggerConfirmed = isPullbackEntry
+      ? pullbackTrigger
+      : (structureBias === 'LONG' ? microTrendUp : microTrendDown);
     console.log(
       `[SCALP][TRIGGER] ${symbol} ${
-        structureBias === 'LONG' ? 'micro_up_confirmed' : 'micro_down_confirmed'
+        isPullbackEntry
+          ? 'pullback_bounce_confirmed'
+          : structureBias === 'LONG'
+            ? 'micro_up_confirmed'
+            : 'micro_down_confirmed'
       }`
     );
 
@@ -943,16 +963,23 @@ export class ScalpingEngine {
     }
 
     const accelRatio = 1 + Math.min(Math.abs(candleMom) / Math.max(MIN_MOM_PCT, 1e-12), 1);
-    let score = entryQualityScore({
-      accelRatio,
-      volShort,
-      tickSpread: spread,
-      htfSpreadPct: ctx.htfSpreadPct,
-      last,
-      ema21: cEma21,
-    });
+    let score = isPullbackEntry
+      ? 40 // pullback base score in the target 35–45 range
+      : entryQualityScore({
+          accelRatio,
+          volShort,
+          tickSpread: spread,
+          htfSpreadPct: ctx.htfSpreadPct,
+          last,
+          ema21: cEma21,
+        });
+    if (isPullbackEntry) {
+      if (cRsi >= 50 && cRsi <= 65) score += 5;
+      if (nearEma21) score += 5;
+      if (pullbackTrigger) score += 5;
+    }
     score = Math.max(0, Math.round(score - penalty));
-    if (structureBias != null && triggerConfirmed) {
+    if (!isPullbackEntry && structureBias != null && triggerConfirmed) {
       score = Math.min(100, score + 5);
     }
 
@@ -969,7 +996,9 @@ export class ScalpingEngine {
       score,
       momentumStrength: Math.abs(candleMom),
       volShort,
-      reason: `${structureBias} structure+trigger score=${score} penalty=${penalty}`,
+      reason: isPullbackEntry
+        ? `pullback_entry score=${score} penalty=${penalty}`
+        : `${structureBias} structure+trigger score=${score} penalty=${penalty}`,
     };
   }
 
