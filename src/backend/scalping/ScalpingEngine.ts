@@ -322,6 +322,8 @@ const SL_MAX_PCT           = 0.005;           // 0.50% cap
 const SL_TIGHTEN_MULT      = 0.9;             // slightly tighter stop vs raw ATR clamp
 const TP_RR                = 2.2;             // baseline RR on SL distance
 const TP_MIN_R_MULT        = 1.5;             // TP distance >= this × SL distance
+/** Min net TP move (after fees) per unit vs SL distance — filter only; does not change TP/ATR. */
+const MIN_NET_R_MULTIPLE   = 1.2;
 
 // Entry quality — acceleration, pullback, noise, score, sizing
 const ACCEL_BLOCK_N        = 5;
@@ -331,7 +333,7 @@ const NOISE_K              = 28;
 const MICRO_NOISE_FLOOR    = 5e-7;
 const FLIP_MAX             = 14;
 const CONSISTENCY_MIN      = 0.08;
-const ENTRY_SCORE_MIN      = 35;
+const ENTRY_SCORE_MIN      = 68;
 const SCORE_SIZE_MIN       = 0.45;            // size scale at minimum qualifying score
 
 interface ScalpMarketContext {
@@ -1061,6 +1063,13 @@ export class ScalpingEngine {
         `SKIP ${symbol} ${side} cause=fee_rr(netTPmove=${netTpMovePerUnit.toFixed(6)} need>${(slDist * 0.6).toFixed(6)} ` +
           `tpDist=${tpDist.toFixed(6)} fees/amt=${(roundTripFees / amount).toFixed(6)})`
       );
+      return;
+    }
+
+    const { entryFee, exitFee } = entryExitFees(price, tp, amount);
+    const netMoveAfterFees = tpDist - (entryFee + exitFee) / amount;
+    if (netMoveAfterFees < slDist * MIN_NET_R_MULTIPLE) {
+      this.addLog(`[SCALP] SKIP ${symbol} cause=net_edge_too_low`);
       return;
     }
 
