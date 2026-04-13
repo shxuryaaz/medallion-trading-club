@@ -595,7 +595,8 @@ export interface Position {
   takeProfit: number;
   timestamp: number;
   initialStopDist: number; // ATR-based stop distance at entry, used for trailing stop logic
-  engineId?: string; // 'swing' | 'scalp' — which engine owns this position
+  engineId?: string;       // 'swing' | 'scalp' — which engine owns this position
+  exchangeOrderId?: number; // Binance order ID for the entry, set after live placement
 }
 
 export class RiskAgent {

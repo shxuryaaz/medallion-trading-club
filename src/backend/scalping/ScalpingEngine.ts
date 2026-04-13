@@ -9,6 +9,7 @@ import { WebSocketManager } from '../data/WebSocketManager';
 import { StateStore, type EngineStateSnapshot } from '../persistence/StateStore';
 import { closedTradeNetAmount, entryExitFees, feeOnNotional, minTpDistanceForFees } from '../fees';
 import { DEFAULT_WATCHLIST_PANEL_SYMBOLS } from '../../constants/watchlistPanel.ts';
+import { exchange } from '../exchange/BinanceClient';
 
 // ── Indicator helpers (inlined — no dependency on swing engine math) ──────────
 
@@ -686,7 +687,7 @@ export class ScalpingEngine {
    * Check SL/TP for every open position using the latest WS price.
    * No await — purely in-memory, runs in microseconds.
    */
-  private monitorPositions(): void {
+  private async monitorPositions(): Promise<void> {
     for (let i = this.activePositions.length - 1; i >= 0; i--) {
       const pos   = this.activePositions[i];
       const price = this.ws.getLatestPrice(pos.symbol);
@@ -703,7 +704,7 @@ export class ScalpingEngine {
         if (price <= pos.takeProfit) closeReason = 'TP';
       }
 
-      if (closeReason) this.closePosition(i, price, closeReason);
+      if (closeReason) await this.closePosition(i, price, closeReason);
     }
   }
 
@@ -791,7 +792,7 @@ export class ScalpingEngine {
 
     // Hard noise gate — reject choppy tape before any further evaluation
     const noiseCheck = tickNoiseGate(prices, symbol);
-    if (!noiseCheck.ok) return { ok: false, reason: noiseCheck.reason };
+    if (noiseCheck.ok === false) return { ok: false, reason: noiseCheck.reason };
 
     const volPack = tickReturnVolatility(prices, VOL_SHORT_RETURNS, VOL_LONG_RETURNS);
     if (volPack == null) return { ok: false, reason: 'vol_insufficient_ticks' };
@@ -1025,6 +1026,11 @@ export class ScalpingEngine {
     this.tradeHistory.push(trade);
     this.lastTradeOpenedAt = Date.now();
 
+    // Place live order on exchange (fire-and-forget — does not block local position registration)
+    exchange.placeMarketOrder(symbol, side === 'LONG' ? 'BUY' : 'SELL', amount)
+      .then(r => { if (r) position.exchangeOrderId = r.orderId; })
+      .catch(err => this.addLog(`[Exchange] Entry order failed: ${(err as Error).message}`));
+
     this.persistState();
     this.addLog(
       `OPEN ${side} ${symbol} @ ${price.toFixed(4)} ` +
@@ -1036,20 +1042,25 @@ export class ScalpingEngine {
     );
   }
 
-  private closePosition(index: number, price: number, reason: string): void {
+  private async closePosition(index: number, price: number, reason: string): Promise<void> {
     const pos = this.activePositions[index];
 
-    const grossPnl = pos.side === 'LONG'
-      ? (price - pos.entryPrice) * pos.amount
-      : (pos.entryPrice - price) * pos.amount;
+    // Attempt live close on exchange; use actual fill price if available
+    let closePrice = price;
+    const result = await exchange.closePosition(pos.symbol, pos.side, pos.amount);
+    if (result?.avgPrice && result.avgPrice > 0) closePrice = result.avgPrice;
 
-    const { entryFee, exitFee } = entryExitFees(pos.entryPrice, price, pos.amount);
+    const grossPnl = pos.side === 'LONG'
+      ? (closePrice - pos.entryPrice) * pos.amount
+      : (pos.entryPrice - closePrice) * pos.amount;
+
+    const { entryFee, exitFee } = entryExitFees(pos.entryPrice, closePrice, pos.amount);
     const netPnl = grossPnl - entryFee - exitFee;
 
     // Update trade log
     const trade = this.tradeHistory.find(t => t.id === pos.tradeId);
     if (trade) {
-      trade.exitPrice     = price;
+      trade.exitPrice     = closePrice;
       trade.grossPnl      = grossPnl;
       trade.entryFee      = entryFee;
       trade.exitFee       = exitFee;
@@ -1066,7 +1077,7 @@ export class ScalpingEngine {
     this.symbolLastClosedAt.set(pos.symbol, Date.now());
 
     this.addLog(
-      `CLOSE ${pos.symbol} @ ${price.toFixed(4)} (${reason}) ` +
+      `CLOSE ${pos.symbol} @ ${closePrice.toFixed(4)} (${reason}) ` +
       `Net=${netPnl >= 0 ? '+' : ''}${netPnl.toFixed(2)} gross=${grossPnl.toFixed(2)} fees=${(entryFee + exitFee).toFixed(2)} ` +
       `balance=${this.portfolio.getBalance().toFixed(2)}`
     );

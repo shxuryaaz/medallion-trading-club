@@ -92,6 +92,17 @@ export class PortfolioManager {
   }
 
   /**
+   * Overwrite the local balance with the live exchange balance.
+   * Called once on startup when BINANCE_ENABLED=true so paper and live balances stay in sync.
+   */
+  setBalance(balance: number): void {
+    if (!Number.isFinite(balance) || balance <= 0) return;
+    this.balance = balance;
+    StateStore.scheduleSave();
+    console.log(`[Portfolio] Balance synced from exchange: ${balance.toFixed(2)}`);
+  }
+
+  /**
    * How many trades does this engine currently have in the risk registry?
    * Used by engines to enforce their own per-engine trade cap.
    */

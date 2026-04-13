@@ -13,6 +13,7 @@ import { StateStore, loadState } from './backend/storage/StateStore.ts';
 import { WebSocketManager } from './backend/data/WebSocketManager.ts';
 import { DataLayer } from './backend/DataLayer.ts';
 import { ScoringEngine } from './backend/Engine.ts';
+import { exchange } from './backend/exchange/BinanceClient.ts';
 import { runBacktest } from './backend/backtest/BacktestRunner.ts';
 import { classifyWatchlistTicks } from './backend/watchlistTickClassify.ts';
 
@@ -39,6 +40,11 @@ async function startServer() {
     scalp: scalpEngine.getPersistSnapshot(),
   }));
   StateStore.scheduleSave();
+
+  // Sync balance from exchange on startup (no-op when BINANCE_ENABLED is not 'true')
+  exchange.getUsdtBalance().then(liveBalance => {
+    if (liveBalance != null) portfolio.setBalance(liveBalance);
+  }).catch(err => console.error('[server] Balance sync failed:', err));
 
   // ── Routes ──────────────────────────────────────────────────────────────────
 

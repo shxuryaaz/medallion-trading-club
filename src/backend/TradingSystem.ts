@@ -13,6 +13,7 @@ import type { TradeLog } from './types';
 import { StateStore, type EngineStateSnapshot } from './persistence/StateStore';
 import { PortfolioManager } from './portfolio/PortfolioManager';
 import { closedTradeNetAmount, entryExitFees, minTpDistanceForFees } from './fees';
+import { exchange } from './exchange/BinanceClient';
 
 export type { TradeLog } from './types';
 
@@ -422,6 +423,11 @@ export class TradingSystem {
     // Register risk with portfolio — synchronous, immediately after push
     this.portfolio.registerTrade(ENGINE_ID, tradeId, symbol, riskAtStop(position));
 
+    // Place live order on exchange (fire-and-forget — does not block local position registration)
+    exchange.placeMarketOrder(symbol, side === 'LONG' ? 'BUY' : 'SELL', position.amount)
+      .then(r => { if (r) position.exchangeOrderId = r.orderId; })
+      .catch(err => this.addLog(`[Exchange] Entry order failed: ${(err as Error).message}`));
+
     this.persistState();
     this.lastTradeOpenedAt = Date.now();
     this.addLog(`OPEN ${side} ${symbol} @ ${price} (tradeId=${tradeId})`);
@@ -446,12 +452,12 @@ export class TradingSystem {
       }
 
       if (shouldClose) {
-        this.closePosition(i, currentPrice, reason);
+        await this.closePosition(i, currentPrice, reason);
       }
     }
   }
 
-  private closePosition(index: number, price: number, reason: string) {
+  private async closePosition(index: number, price: number, reason: string) {
     const pos = this.activePositions[index];
     if (!pos.tradeId) {
       this.addLog(`ERROR closePosition: missing tradeId for symbol=${pos.symbol}`);
@@ -464,18 +470,23 @@ export class TradingSystem {
       return;
     }
 
+    // Attempt live close on exchange; use actual fill price if available
+    let closePrice = price;
+    const result = await exchange.closePosition(pos.symbol, pos.side, pos.amount);
+    if (result?.avgPrice && result.avgPrice > 0) closePrice = result.avgPrice;
+
     const grossPnl =
       pos.side === 'LONG'
-        ? (price - pos.entryPrice) * pos.amount
-        : (pos.entryPrice - price) * pos.amount;
+        ? (closePrice - pos.entryPrice) * pos.amount
+        : (pos.entryPrice - closePrice) * pos.amount;
 
-    const { entryFee, exitFee } = entryExitFees(pos.entryPrice, price, pos.amount);
+    const { entryFee, exitFee } = entryExitFees(pos.entryPrice, closePrice, pos.amount);
     const netPnl = grossPnl - entryFee - exitFee;
 
     // Portfolio: credit net PnL + remove from risk registry
     this.portfolio.closeTrade(pos.tradeId, netPnl);
 
-    trade.exitPrice     = price;
+    trade.exitPrice     = closePrice;
     trade.grossPnl      = grossPnl;
     trade.entryFee      = entryFee;
     trade.exitFee       = exitFee;
@@ -485,7 +496,7 @@ export class TradingSystem {
     trade.exitTimestamp = Date.now();
 
     this.addLog(
-      `CLOSE ${pos.symbol} @ ${price} (${reason}). Net ${netPnl.toFixed(2)} (gross ${grossPnl.toFixed(2)} fees ${(entryFee + exitFee).toFixed(2)})`
+      `CLOSE ${pos.symbol} @ ${closePrice} (${reason}). Net ${netPnl.toFixed(2)} (gross ${grossPnl.toFixed(2)} fees ${(entryFee + exitFee).toFixed(2)})`
     );
 
     this.symbolLastClosedAt.set(pos.symbol, Date.now());
