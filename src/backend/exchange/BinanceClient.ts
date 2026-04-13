@@ -199,11 +199,10 @@ export class BinanceClient {
     if (!this.enabled) return null;
 
     try {
-      const data = await this.signedGet('/fapi/v2/balance') as Array<Record<string, unknown>>;
-      const usdt = data.find((a) => a.asset === 'USDT');
-      if (!usdt) return null;
-      const balance = parseFloat(String(usdt.availableBalance));
-      console.log(`[BinanceClient] Fetched USDT balance: ${balance.toFixed(2)}`);
+      const data = await this.signedGet('/fapi/v2/account') as Record<string, unknown>;
+      // totalMarginBalance = wallet balance + unrealized PnL — true account equity
+      const balance = parseFloat(String(data.totalMarginBalance));
+      console.log(`[BinanceClient] Fetched USDT equity: ${balance.toFixed(2)}`);
       return balance;
     } catch (err: unknown) {
       const msg = axios.isAxiosError(err)
