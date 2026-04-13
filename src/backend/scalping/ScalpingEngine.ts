@@ -24,49 +24,6 @@ function computeEMA(prices: number[], period: number): number {
   return ema;
 }
 
-/**
- * Wilder-smoothed RSI. Returns null if there are not enough data points.
- * period = 7 for scalping (faster reaction than the swing engine's 14).
- */
-function computeRSI(prices: number[], period = 7): number | null {
-  if (prices.length < period + 1) return null;
-
-  let avgGain = 0;
-  let avgLoss = 0;
-
-  for (let i = 1; i <= period; i++) {
-    const delta = prices[i] - prices[i - 1];
-    avgGain += delta > 0 ? delta : 0;
-    avgLoss += delta < 0 ? -delta : 0;
-  }
-  avgGain /= period;
-  avgLoss /= period;
-
-  for (let i = period + 1; i < prices.length; i++) {
-    const delta = prices[i] - prices[i - 1];
-    avgGain = (avgGain * (period - 1) + Math.max(delta, 0)) / period;
-    avgLoss = (avgLoss * (period - 1) + Math.max(-delta, 0)) / period;
-  }
-
-  if (avgLoss === 0) return avgGain > 0 ? 100 : 50;
-  const rs = avgGain / avgLoss;
-  return Math.min(100, Math.max(0, 100 - 100 / (1 + rs)));
-}
-
-/**
- * Micro-momentum: direction of price movement over the last `lookback` ticks.
- * Returns 'up' / 'down' / 'flat'.
- */
-function microMomentum(prices: number[], lookback = 5): 'up' | 'down' | 'flat' {
-  if (prices.length < lookback + 1) return 'flat';
-  const slice = prices.slice(-lookback - 1);
-  const delta = slice[slice.length - 1] - slice[0];
-  const threshold = slice[0] * 0.0001; // 0.01% of price
-  if (delta > threshold) return 'up';
-  if (delta < -threshold) return 'down';
-  return 'flat';
-}
-
 /** Population stdev of `values` (returns 0 if length < 2). */
 function stdevPopulation(values: number[]): number {
   const n = values.length;
@@ -172,65 +129,6 @@ function tickNoiseGate(
   return { ok: true };
 }
 
-function meanAbs(arr: number[]): number {
-  if (arr.length === 0) return 0;
-  return arr.reduce((s, x) => s + Math.abs(x), 0) / arr.length;
-}
-
-function tickAcceleration(
-  prices: number[],
-  n: number,
-  side: 'LONG' | 'SHORT'
-):
-  | { ok: true; strengthRecent: number; strengthPrev: number; sumRecent: number; ratio: number }
-  | { ok: false; reason: string } {
-  if (prices.length < 2 * n + 1) return { ok: false, reason: 'accel_insufficient' };
-  const returns: number[] = [];
-  for (let i = 1; i < prices.length; i++) {
-    const prev = prices[i - 1];
-    if (prev === 0) continue;
-    returns.push((prices[i] - prev) / prev);
-  }
-  if (returns.length < 2 * n) return { ok: false, reason: 'accel_insufficient' };
-  const lastN = returns.slice(-n);
-  const prevN = returns.slice(-2 * n, -n);
-  const strengthRecent = meanAbs(lastN);
-  const strengthPrev = meanAbs(prevN);
-  const sumRecent = lastN.reduce((s, x) => s + x, 0);
-  if (strengthPrev < 1e-12) return { ok: false, reason: 'accel_insufficient' };
-  const ratio = strengthRecent / strengthPrev;
-  if (side === 'LONG') {
-    if (sumRecent <= 0) return { ok: false, reason: 'accel_no_drift_up' };
-    if (strengthRecent <= strengthPrev * (1 + ACCEL_EPS)) return { ok: false, reason: 'accel_not_increasing' };
-  } else {
-    if (sumRecent >= 0) return { ok: false, reason: 'accel_no_drift_down' };
-    if (strengthRecent <= strengthPrev * (1 + ACCEL_EPS)) return { ok: false, reason: 'accel_not_increasing' };
-  }
-  return { ok: true, strengthRecent, strengthPrev, sumRecent, ratio };
-}
-
-function pullbackOkLong(prices: number[]): { ok: true } | { ok: false; reason: string } {
-  if (prices.length < PULLBACK_W) return { ok: false, reason: 'pullback_insufficient' };
-  const priorHigh = Math.max(...prices.slice(-PULLBACK_W, -3));
-  const pullbackLow = Math.min(...prices.slice(-8, -2));
-  const last = prices[prices.length - 1];
-  if (!(pullbackLow < priorHigh)) return { ok: false, reason: 'no_pullback_long' };
-  if (!(last > pullbackLow)) return { ok: false, reason: 'pullback_no_bounce' };
-  if (last > priorHigh) return { ok: false, reason: 'chasing_high' };
-  return { ok: true };
-}
-
-function pullbackOkShort(prices: number[]): { ok: true } | { ok: false; reason: string } {
-  if (prices.length < PULLBACK_W) return { ok: false, reason: 'pullback_insufficient' };
-  const priorLow = Math.min(...prices.slice(-PULLBACK_W, -3));
-  const pullbackHigh = Math.max(...prices.slice(-8, -2));
-  const last = prices[prices.length - 1];
-  if (!(pullbackHigh > priorLow)) return { ok: false, reason: 'no_pullback_short' };
-  if (!(last < pullbackHigh)) return { ok: false, reason: 'pullback_no_bounce' };
-  if (last < priorLow) return { ok: false, reason: 'chasing_low' };
-  return { ok: true };
-}
-
 function entryQualityScore(params: {
   accelRatio: number;
   volShort: number;
@@ -284,6 +182,8 @@ function htfTrendFlags(
 // ── Strategy constants ────────────────────────────────────────────────────────
 
 const ENGINE_ID            = 'scalp';
+// Symbols excluded from scalping: low-price assets with precision/fee issues and no observed scalp edge
+const SCALP_EXCLUDED_SYMBOLS = new Set(['PEPEUSDT', 'DOGEUSDT']);
 const LOOP_INTERVAL_MS     = 4_000;           // scan every 4 seconds
 const TRADE_COOLDOWN_MS    = 60_000;          // 1 min global cooldown between scalp opens
 const SYMBOL_POST_CLOSE_COOLDOWN_MS = 75_000; // per-symbol after close (30–120s band)
@@ -292,13 +192,7 @@ const LOSS_STREAK_COUNT    = 5;               // losses in a row before pause
 const MAX_POSITIONS        = 3;               // max concurrent scalp trades
 const NOTIONAL_FRAC        = 0.08;            // 8% of balance per trade notional
 const MIN_EMA_SPREAD_PCT   = 0.00025;         // EMA9/21 must be at least ~0.025% apart
-const MIN_RSI_LONG         = 50;              // RSI must be above this for LONG
-const MAX_RSI_SHORT        = 50;              // RSI must be below this for SHORT
-const MAX_RSI_LONG_ENTRY   = 70;              // overextension — no LONG if RSI above this
-const MIN_RSI_SHORT_ENTRY  = 30;              // overextension — no SHORT if RSI below this
-const MAX_STRETCH_FROM_EMA = 0.0025;          // max |price-ema21|/ema21 for entry (0.25%)
-const MIN_MOM_LOOKBACK     = 5;
-const MIN_MOM_PCT          = 0.000105;        // min |Δprice|/price over lookback (~30% relaxed vs prior)
+const MAX_STRETCH_FROM_EMA = 0.0025;          // entryQualityScore distance vs ema21 (soft)
 const MIN_BUFFER_TICKS       = 130;             // covers vol long window + EMA21 (when HTF cache seeded)
 const MIN_BUFFER_TICKS_COLD = 60;              // WS-only warmup when 1m cache missing / thinner context
 
@@ -315,25 +209,29 @@ const OHLCV_FETCH_LIMIT    = 130;
 const HTF_MIN_5M_BARS      = 22;              // ≥21 closes for EMA21 seed + value
 
 // ATR-based SL / TP (exit-only tuning — entry logic unchanged)
-const ATR_PERIOD_SCALP     = 14;
-const ATR_STOP_MULT        = 1.25;
+const ATR_PERIOD_SCALP     = 7;               // shorter window matches seconds-scale entry trigger
+const ATR_STOP_MULT        = 1.0;             // tighter SL to reduce avg loss size
 const SL_MIN_PCT           = 0.0025;          // 0.25% floor on stop distance
 const SL_MAX_PCT           = 0.005;           // 0.50% cap
 const SL_TIGHTEN_MULT      = 0.9;             // slightly tighter stop vs raw ATR clamp
-const TP_RR                = 2.2;             // baseline RR on SL distance
-const TP_MIN_R_MULT        = 1.5;             // TP distance >= this × SL distance
+const TP_RR                = 2.2;             // raised: 24% win rate requires >3:1 RR to break even
+const TP_MIN_R_MULT        = 2.5;             // TP floor raised to ensure adequate edge after fees
 /** Min net TP move (after fees) per unit vs SL distance — filter only; does not change TP/ATR. */
 const MIN_NET_R_MULTIPLE   = 1.2;
 
-// Entry quality — acceleration, pullback, noise, score, sizing
-const ACCEL_BLOCK_N        = 5;
-const ACCEL_EPS            = 0.08;            // recent block must exceed prior by ~8%
-const PULLBACK_W           = 20;
+// Impulse scalping — last-N tick returns
+const IMPULSE_RETURN_COUNT  = 6;              // 5–8 tick returns
+const IMPULSE_MIN           = 0.00028;        // min sum(|r|) over N (weak impulse below this)
+const IMPULSE_DIRECTION_FRAC = 0.7;           // ≥70% of ticks same sign
+/** Minimum short-window volatility (same scale as tickReturnVolatility shortVol). */
+const VOL_MIN               = MIN_TICK_VOL;
+
+// Entry quality — noise, score, sizing
 const NOISE_K              = 28;
 const MICRO_NOISE_FLOOR    = 5e-7;
 const FLIP_MAX             = 14;
 const CONSISTENCY_MIN      = 0.08;
-const ENTRY_SCORE_MIN      = 68;
+const ENTRY_SCORE_MIN      = 70;            // raised: empirical data shows sub-70 entries losing at high rate
 const SCORE_SIZE_MIN       = 0.45;            // size scale at minimum qualifying score
 
 interface ScalpMarketContext {
@@ -735,19 +633,27 @@ export class ScalpingEngine {
     }
   }
 
-  /** Cached 1m bars + pseudo-5m EMA trend; network refresh rate-limited in DataLayer.getScalpContext1m. */
+  /** 1m bars for ATR + soft HTF hints; impulse entries do not hard-require HTF alignment. */
   private async ensureScalpMarketContext(symbol: string): Promise<ScalpMarketContext | null> {
     try {
       const bars = await DataLayer.getScalpContext1m(symbol, OHLCV_FETCH_LIMIT);
-      if (bars.length < HTF_MIN_5M_BARS * 5) return null;
+      const minBars = Math.max(ATR_PERIOD_SCALP + 2, 30);
+      if (bars.length < minBars) return null;
       this.ohlcvCache.set(symbol, { bars, fetchedAt: Date.now() });
       const flags = htfTrendFlags(bars);
-      if (flags == null) return null;
+      if (flags != null) {
+        return {
+          ohlcv: bars,
+          allowsLong: flags.allowsLong,
+          allowsShort: flags.allowsShort,
+          htfSpreadPct: flags.htfSpreadPct,
+        };
+      }
       return {
         ohlcv: bars,
-        allowsLong: flags.allowsLong,
-        allowsShort: flags.allowsShort,
-        htfSpreadPct: flags.htfSpreadPct,
+        allowsLong: true,
+        allowsShort: true,
+        htfSpreadPct: 0,
       };
     } catch {
       return null;
@@ -881,130 +787,122 @@ export class ScalpingEngine {
   // ── Signal logic ──────────────────────────────────────────────────────────
 
   private evaluateEntry(symbol: string, prices: number[], ctx: ScalpMarketContext): EntryEval {
+    if (SCALP_EXCLUDED_SYMBOLS.has(symbol)) return { ok: false, reason: 'symbol_excluded' };
+
+    // Hard noise gate — reject choppy tape before any further evaluation
+    const noiseCheck = tickNoiseGate(prices, symbol);
+    if (!noiseCheck.ok) return { ok: false, reason: noiseCheck.reason };
+
     const volPack = tickReturnVolatility(prices, VOL_SHORT_RETURNS, VOL_LONG_RETURNS);
-    const volShort = volPack?.shortVol ?? 0;
+    if (volPack == null) return { ok: false, reason: 'vol_insufficient_ticks' };
+    const volShort = volPack.shortVol;
+
+    // Volume / volatility gate (impulse scalping)
+    if (volShort <= VOL_MIN) {
+      return { ok: false, reason: `vol_below_min(${volShort.toExponential(2)})` };
+    }
+    if (volShort >= MAX_TICK_VOL) {
+      console.log(`[SCALP] SKIP cause=vol_extreme ${symbol} shortVol=${volShort.toExponential(2)}`);
+      return { ok: false, reason: 'vol_extreme' };
+    }
+
+    const n = IMPULSE_RETURN_COUNT;
+    if (prices.length < n + 1) return { ok: false, reason: 'impulse_insufficient_ticks' };
+    const recentReturns = lastKReturns(prices, n);
+    if (recentReturns.length < n) return { ok: false, reason: 'impulse_insufficient_ticks' };
+
+    const impulseStrength = recentReturns.reduce((s, r) => s + Math.abs(r), 0);
+    const directionalBias = recentReturns.reduce((s, r) => s + r, 0);
+    const posTicks = recentReturns.filter((r) => r > 0).length;
+    const negTicks = recentReturns.filter((r) => r < 0).length;
+    const posFrac = posTicks / n;
+    const negFrac = negTicks / n;
+
+    if (impulseStrength < IMPULSE_MIN) {
+      console.log(
+        `[SCALP] SKIP cause=weak_impulse ${symbol} strength=${impulseStrength.toExponential(3)}`
+      );
+      return { ok: false, reason: 'weak_impulse' };
+    }
+
+    let side: 'LONG' | 'SHORT' | null = null;
+    if (directionalBias > 0 && impulseStrength > IMPULSE_MIN && posFrac >= IMPULSE_DIRECTION_FRAC) {
+      side = 'LONG';
+    } else if (
+      directionalBias < 0 &&
+      impulseStrength > IMPULSE_MIN &&
+      negFrac >= IMPULSE_DIRECTION_FRAC
+    ) {
+      side = 'SHORT';
+    }
+
+    if (side == null) {
+      return { ok: false, reason: 'no_impulse' };
+    }
+
+    // Require that the 3 ticks preceding the impulse window also lean in the same direction.
+    // This ensures the move has been building, not just a single noise burst at the end.
+    if (prices.length >= n + 4) {
+      const preImpulseReturns = lastKReturns(prices, n + 3).slice(0, 3);
+      const preAligned = preImpulseReturns.filter(r => side === 'LONG' ? r > 0 : r < 0).length;
+      if (preAligned < 2) {
+        return { ok: false, reason: 'impulse_no_buildup' };
+      }
+    }
+
+    console.log(
+      `[SCALP] IMPULSE ${side} strength=${impulseStrength.toExponential(3)} bias=${directionalBias.toExponential(3)} ` +
+        `${symbol} posFrac=${posFrac.toFixed(2)} negFrac=${negFrac.toFixed(2)}`
+    );
+
+    const closes = ctx.ohlcv.map((c) => c.close);
     const last = prices[prices.length - 1];
+    const cEma9 = closes.length >= 9 ? computeEMA(closes, 9) : last;
+    const cEma21 = closes.length >= 21 ? computeEMA(closes, 21) : last;
+    const spread =
+      closes.length >= 21
+        ? Math.abs(cEma9 - cEma21) / Math.max(Math.abs(cEma21), 1e-12)
+        : 0;
 
-    // ── STRUCTURE layer (1m candles) ───────────────────────────────────────
-    const candles = ctx.ohlcv;
-    const closes = candles.map((c) => c.close);
-    if (closes.length < 30) return { ok: false, reason: 'structure_insufficient' };
+    // Hard-reject counter-trend entries — a soft penalty is insufficient given low win rate
+    if (side === 'LONG' && !ctx.allowsLong) return { ok: false, reason: 'htf_conflict_long' };
+    if (side === 'SHORT' && !ctx.allowsShort) return { ok: false, reason: 'htf_conflict_short' };
 
-    const cEma9 = computeEMA(closes, 9);
-    const cEma21 = computeEMA(closes, 21);
-    const cRsi = computeRSI(closes, 7);
-    if (cRsi == null) return { ok: false, reason: 'rsi_insufficient' };
-    const prevClose = closes[closes.length - 2];
-    const candleMom = prevClose > 0 ? (closes[closes.length - 1] - prevClose) / prevClose : 0;
-
-    let structureBias: 'LONG' | 'SHORT' | null = null;
-    if (cEma9 > cEma21 && cRsi > 50 && candleMom > 0) structureBias = 'LONG';
-    else if (cEma9 < cEma21 && cRsi < 50 && candleMom < 0) structureBias = 'SHORT';
-    const nearEma9 = Math.abs(last - cEma9) / Math.max(Math.abs(cEma9), 1e-12) <= MAX_STRETCH_FROM_EMA;
-    const nearEma21 = Math.abs(last - cEma21) / Math.max(Math.abs(cEma21), 1e-12) <= MAX_STRETCH_FROM_EMA;
-    const pullbackLongCandidate =
-      cEma9 > cEma21 &&
-      cRsi > 48 &&
-      candleMom < 0 &&
-      candleMom > -0.003 &&
-      (nearEma9 || nearEma21);
-    const isPullbackEntry = structureBias == null && pullbackLongCandidate;
-
-    console.log(
-      `[SCALP][STRUCTURE] ${symbol} ${structureBias ?? 'NONE'} ` +
-        `ema=${cEma9.toFixed(4)}/${cEma21.toFixed(4)} rsi=${cRsi.toFixed(1)} mom=${(candleMom * 100).toFixed(3)}%`
-    );
-
-    if (structureBias == null && !isPullbackEntry) {
-      return {
-        ok: false,
-        reason: `no_signal(structure ema=${cEma9 > cEma21 ? 'bull' : 'bear'} rsi=${cRsi.toFixed(1)} mom=${(candleMom * 100).toFixed(3)}%)`,
-      };
-    }
-    if (isPullbackEntry) structureBias = 'LONG';
-
-    // ── TRIGGER layer (ticks) ──────────────────────────────────────────────
-    if (prices.length < 2) return { ok: false, reason: 'trigger_insufficient' };
-    const t = prices;
-    const a = t[t.length - 1];
-    const b = t[t.length - 2];
-    const microTrendUp = a > b;
-    const microTrendDown = a < b;
-
-    const pullbackTrigger = microTrendUp; // small bounce confirmation after pullback
-    if (isPullbackEntry && !pullbackTrigger) {
-      return { ok: false, reason: 'pullback_trigger_not_confirmed' };
-    }
-    if (!isPullbackEntry && structureBias === 'LONG' && !microTrendUp) {
-      return { ok: false, reason: 'trigger_not_confirmed_long' };
-    }
-    if (!isPullbackEntry && structureBias === 'SHORT' && !microTrendDown) {
-      return { ok: false, reason: 'trigger_not_confirmed_short' };
-    }
-    const triggerConfirmed = isPullbackEntry
-      ? pullbackTrigger
-      : (structureBias === 'LONG' ? microTrendUp : microTrendDown);
-    console.log(
-      `[SCALP][TRIGGER] ${symbol} ${
-        isPullbackEntry
-          ? 'pullback_bounce_confirmed'
-          : structureBias === 'LONG'
-            ? 'micro_up_confirmed'
-            : 'micro_down_confirmed'
-      }`
-    );
-
-    // Soft filters / penalties
-    const spread = Math.abs(cEma9 - cEma21) / Math.max(Math.abs(cEma21), 1e-12);
     let penalty = 0;
-    if (spread < MIN_EMA_SPREAD_PCT) penalty += 6;
-    if (structureBias === 'LONG' && !ctx.allowsLong) penalty += 10;
-    if (structureBias === 'SHORT' && !ctx.allowsShort) penalty += 10;
+    if (spread > 0 && spread < MIN_EMA_SPREAD_PCT) penalty += 6;
 
-    const returns = lastKReturns(prices, NOISE_K);
-    if (returns.length > 0) {
-      const signedSum = returns.reduce((s, r) => s + (Math.abs(r) > MICRO_NOISE_FLOOR ? Math.sign(r) : 0), 0);
-      const consistency = Math.abs(signedSum) / returns.length;
+    const noiseReturns = lastKReturns(prices, NOISE_K);
+    if (noiseReturns.length > 0) {
+      const signedSum = noiseReturns.reduce(
+        (s, r) => s + (Math.abs(r) > MICRO_NOISE_FLOOR ? Math.sign(r) : 0),
+        0
+      );
+      const consistency = Math.abs(signedSum) / noiseReturns.length;
       if (consistency < CONSISTENCY_MIN) penalty += 5;
     }
 
-    const accelRatio = 1 + Math.min(Math.abs(candleMom) / Math.max(MIN_MOM_PCT, 1e-12), 1);
-    let score = isPullbackEntry
-      ? 40 // pullback base score in the target 35–45 range
-      : entryQualityScore({
-          accelRatio,
-          volShort,
-          tickSpread: spread,
-          htfSpreadPct: ctx.htfSpreadPct,
-          last,
-          ema21: cEma21,
-        });
-    if (isPullbackEntry) {
-      if (cRsi >= 50 && cRsi <= 65) score += 5;
-      if (nearEma21) score += 5;
-      if (pullbackTrigger) score += 5;
-    }
+    const accelRatio = 1 + Math.min(impulseStrength / Math.max(IMPULSE_MIN, 1e-12), 2);
+    let score = entryQualityScore({
+      accelRatio,
+      volShort,
+      tickSpread: impulseStrength / n,
+      htfSpreadPct: ctx.htfSpreadPct,
+      last,
+      ema21: cEma21,
+    });
     score = Math.max(0, Math.round(score - penalty));
-    if (!isPullbackEntry && structureBias != null && triggerConfirmed) {
-      score = Math.min(100, score + 5);
-    }
 
-    const hasTrigger = triggerConfirmed;
-    const overrideAllowed = structureBias != null && hasTrigger && score >= ENTRY_SCORE_MIN;
-    if (score < ENTRY_SCORE_MIN && !overrideAllowed) {
+    if (score < ENTRY_SCORE_MIN) {
       return { ok: false, reason: `score_below_${ENTRY_SCORE_MIN}(${score})` };
     }
 
-    console.log(`[SCALP][ENTRY] ${symbol} ${structureBias} score=${score}`);
     return {
       ok: true,
-      side: structureBias,
+      side,
       score,
-      momentumStrength: Math.abs(candleMom),
+      momentumStrength: impulseStrength,
       volShort,
-      reason: isPullbackEntry
-        ? `pullback_entry score=${score} penalty=${penalty}`
-        : `${structureBias} structure+trigger score=${score} penalty=${penalty}`,
+      reason: `impulse_${side} strength=${impulseStrength.toExponential(2)} bias=${directionalBias.toExponential(2)}`,
     };
   }
 
