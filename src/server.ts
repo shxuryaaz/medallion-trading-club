@@ -41,10 +41,15 @@ async function startServer() {
   }));
   StateStore.scheduleSave();
 
-  // Sync balance from exchange on startup (no-op when BINANCE_ENABLED is not 'true')
-  exchange.getUsdtBalance().then(liveBalance => {
-    if (liveBalance != null) portfolio.setBalance(liveBalance);
-  }).catch(err => console.error('[server] Balance sync failed:', err));
+  // Sync balance from exchange — on startup, then every 5 minutes.
+  // No-op when BINANCE_ENABLED is not 'true'.
+  const syncBalance = () =>
+    exchange.getUsdtBalance()
+      .then(liveBalance => { if (liveBalance != null) portfolio.setBalance(liveBalance); })
+      .catch(err => console.error('[server] Balance sync failed:', err));
+
+  syncBalance();
+  setInterval(syncBalance, 5 * 60 * 1000);
 
   // ── Routes ──────────────────────────────────────────────────────────────────
 
