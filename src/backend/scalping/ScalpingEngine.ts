@@ -191,7 +191,11 @@ const SYMBOL_POST_CLOSE_COOLDOWN_MS = 75_000; // per-symbol after close (30–12
 const LOSS_STREAK_PAUSE_MS = 30 * 60_000;     // 30 min pause after 5 consecutive losses
 const LOSS_STREAK_COUNT    = 5;               // losses in a row before pause
 const MAX_POSITIONS        = 3;               // max concurrent scalp trades
-const NOTIONAL_FRAC        = 0.08;            // 8% of balance per trade notional
+const SCALP_LEVERAGE       = 10;              // leverage set on exchange before first trade per symbol
+const NOTIONAL_FRAC        = 0.10;            // fraction of balance used as MARGIN per trade
+//   effective notional = balance × NOTIONAL_FRAC × SCALP_LEVERAGE
+//   $10 account → $1 margin × 10x = $10 notional (workable for ETH/XRP)
+//   $5k account → $500 margin × 10x = $5000 notional
 const MIN_EMA_SPREAD_PCT   = 0.00025;         // EMA9/21 must be at least ~0.025% apart
 const MAX_STRETCH_FROM_EMA = 0.0025;          // entryQualityScore distance vs ema21 (soft)
 const MIN_BUFFER_TICKS       = 130;             // covers vol long window + EMA21 (when HTF cache seeded)
@@ -215,8 +219,10 @@ const ATR_STOP_MULT        = 1.0;             // tighter SL to reduce avg loss s
 const SL_MIN_PCT           = 0.0025;          // 0.25% floor on stop distance
 const SL_MAX_PCT           = 0.005;           // 0.50% cap
 const SL_TIGHTEN_MULT      = 0.9;             // slightly tighter stop vs raw ATR clamp
-const TP_RR                = 2.2;             // raised: 24% win rate requires >3:1 RR to break even
-const TP_MIN_R_MULT        = 2.5;             // TP floor raised to ensure adequate edge after fees
+// With 0.2% round-trip fees and 0.25% SL, net RR = (TP−0.2%)/(SL+0.2%).
+// TP_MIN_R_MULT=4.5 → TP ~1.125%, net RR ≈ 2.06:1, break-even win rate 33%.
+const TP_RR                = 3.5;
+const TP_MIN_R_MULT        = 4.5;
 /** Min net TP move (after fees) per unit vs SL distance — filter only; does not change TP/ATR. */
 const MIN_NET_R_MULTIPLE   = 1.2;
 
@@ -233,7 +239,7 @@ const MICRO_NOISE_FLOOR    = 5e-7;
 const FLIP_MAX             = 14;
 const CONSISTENCY_MIN      = 0.08;
 const ENTRY_SCORE_MIN      = 70;            // raised: empirical data shows sub-70 entries losing at high rate
-const SCORE_SIZE_MIN       = 0.45;            // size scale at minimum qualifying score
+const SCORE_SIZE_MIN       = 1.0;             // flat 10% regardless of score (size managed by entry gate)
 
 interface ScalpMarketContext {
   ohlcv: OHLCV[];
@@ -299,6 +305,11 @@ export class ScalpingEngine {
 
   private lastSignalBySymbol = new Map<string, ScalpLastSignal>();
 
+  /** Funding rate cache: refreshed every 30 min per symbol. */
+  private fundingRateCache = new Map<string, { rate: number; fetchedAt: number }>();
+  private static readonly FUNDING_CACHE_TTL_MS = 30 * 60_000;
+  private static readonly FUNDING_EXTREME      = 0.0003; // 0.03%/8h → avoid crowded side
+
   private minBufferTicksFor(symbol: string): number {
     const ent = this.ohlcvCache.get(symbol);
     if (ent && ent.bars.length >= HTF_MIN_5M_BARS * 5) return MIN_BUFFER_TICKS;
@@ -337,7 +348,29 @@ export class ScalpingEngine {
     this.isRunning = true;
     this.addLog('Scalping engine started.');
     await this.bootstrap();
+    void this.refreshFundingRates(); // initial fetch, then self-schedules
     this.scheduleLoop();
+  }
+
+  /** Fetch funding rates for all watchlist symbols; re-schedules every 30 min. */
+  private async refreshFundingRates(): Promise<void> {
+    for (const symbol of this.watchlist) {
+      const rate = await exchange.getFundingRate(symbol);
+      if (rate !== null) {
+        this.fundingRateCache.set(symbol, { rate, fetchedAt: Date.now() });
+      }
+    }
+    if (this.isRunning) {
+      setTimeout(() => void this.refreshFundingRates(), ScalpingEngine.FUNDING_CACHE_TTL_MS);
+    }
+  }
+
+  /** Returns cached funding rate for symbol, or null if unavailable / stale. */
+  private getCachedFundingRate(symbol: string): number | null {
+    const entry = this.fundingRateCache.get(symbol);
+    if (!entry) return null;
+    if (Date.now() - entry.fetchedAt > ScalpingEngine.FUNDING_CACHE_TTL_MS * 2) return null;
+    return entry.rate;
   }
 
   stop(): void {
@@ -695,12 +728,36 @@ export class ScalpingEngine {
 
       this.applyMark(pos, price);
 
+      // Break-even trailing stop: once price reaches 50% of TP distance,
+      // move SL to entry + round-trip fee buffer so worst case is a scratch.
+      const tpDist   = Math.abs(pos.takeProfit - pos.entryPrice);
+      const progress = pos.side === 'LONG'
+        ? price - pos.entryPrice
+        : pos.entryPrice - price;
+
+      if (progress >= tpDist * 0.5) {
+        // Fee buffer = 0.2% round-trip so we never close at a loss after fees
+        const feeBuffer = pos.entryPrice * 0.002;
+        const beStop    = pos.side === 'LONG'
+          ? pos.entryPrice + feeBuffer
+          : pos.entryPrice - feeBuffer;
+
+        const moved = pos.side === 'LONG'
+          ? beStop > pos.stopLoss
+          : beStop < pos.stopLoss;
+
+        if (moved) {
+          pos.stopLoss = beStop;
+          this.addLog(`[BE] ${pos.symbol} SL → breakeven+fees @ ${beStop.toFixed(4)}`);
+        }
+      }
+
       let closeReason: string | null = null;
       if (pos.side === 'LONG') {
-        if (price <= pos.stopLoss)  closeReason = 'SL';
+        if (price <= pos.stopLoss)   closeReason = 'SL';
         if (price >= pos.takeProfit) closeReason = 'TP';
       } else {
-        if (price >= pos.stopLoss)  closeReason = 'SL';
+        if (price >= pos.stopLoss)   closeReason = 'SL';
         if (price <= pos.takeProfit) closeReason = 'TP';
       }
 
@@ -766,11 +823,39 @@ export class ScalpingEngine {
         continue;
       }
 
+      // Funding rate guard: avoid entering on the crowded side
+      const fundingRate = this.getCachedFundingRate(symbol);
+
       const entry = this.evaluateEntry(symbol, prices, ctx);
 
       if (!entry.ok) {
         this.addLog(`SKIP ${symbol} cause=${entry.reason}`);
         continue;
+      }
+
+      // Block entries that fight an extreme funding rate
+      if (fundingRate !== null) {
+        if (entry.side === 'LONG' && fundingRate > ScalpingEngine.FUNDING_EXTREME) {
+          this.addLog(`SKIP ${symbol} cause=funding_long_squeeze(${fundingRate.toFixed(5)})`);
+          continue;
+        }
+        if (entry.side === 'SHORT' && fundingRate < -ScalpingEngine.FUNDING_EXTREME) {
+          this.addLog(`SKIP ${symbol} cause=funding_short_squeeze(${fundingRate.toFixed(5)})`);
+          continue;
+        }
+      }
+
+      // CVD gate: only enter when order flow confirms the impulse direction
+      const cvd = this.ws.getCVD(symbol, 30_000);
+      if (cvd !== null) {
+        if (entry.side === 'LONG' && cvd.cvd < 0) {
+          this.addLog(`SKIP ${symbol} cause=cvd_bearish_flow(${cvd.cvd.toFixed(4)})`);
+          continue;
+        }
+        if (entry.side === 'SHORT' && cvd.cvd > 0) {
+          this.addLog(`SKIP ${symbol} cause=cvd_bullish_flow(${cvd.cvd.toFixed(4)})`);
+          continue;
+        }
       }
 
       const price = this.ws.getLatestPrice(symbol)!;
@@ -925,7 +1010,8 @@ export class ScalpingEngine {
 
     const balance  = this.portfolio.getBalance();
     const scale    = scoreToNotionalScale(entryQuality.score);
-    const notional = balance * NOTIONAL_FRAC * scale;
+    // Notional = margin × leverage (the actual position size sent to exchange)
+    const notional = balance * NOTIONAL_FRAC * SCALP_LEVERAGE * scale;
     const amount   = notional / price;
 
     const rawSl = ATR_STOP_MULT * atr;
@@ -1026,7 +1112,9 @@ export class ScalpingEngine {
     this.tradeHistory.push(trade);
     this.lastTradeOpenedAt = Date.now();
 
-    // Place live order on exchange (fire-and-forget — does not block local position registration)
+    // Set leverage then place order (fire-and-forget — does not block local position registration)
+    exchange.setLeverage(symbol, SCALP_LEVERAGE)
+      .catch(() => { /* default leverage used on failure */ });
     exchange.placeMarketOrder(symbol, side === 'LONG' ? 'BUY' : 'SELL', amount)
       .then(r => { if (r) position.exchangeOrderId = r.orderId; })
       .catch(err => this.addLog(`[Exchange] Entry order failed: ${(err as Error).message}`));
@@ -1036,7 +1124,7 @@ export class ScalpingEngine {
       `OPEN ${side} ${symbol} @ ${price.toFixed(4)} ` +
       `SL=${sl.toFixed(4)} TP=${tp.toFixed(4)} ` +
       `slDist=${slDist.toFixed(6)} tpDist=${tpDist.toFixed(6)} R:R=${riskReward.toFixed(2)} ` +
-      `size=${notional.toFixed(2)}$ scale=${scale.toFixed(2)} ` +
+      `size=${notional.toFixed(2)}$(${SCALP_LEVERAGE}x) scale=${scale.toFixed(2)} ` +
       `score=${entryQuality.score} momStr=${entryQuality.momentumStrength.toExponential(2)} ` +
       `volShort=${entryQuality.volShort.toExponential(2)} | ${signalReason}`
     );

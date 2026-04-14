@@ -1,20 +1,32 @@
 /**
- * WebSocketManager — real-time price feeds via Binance miniTicker streams.
+ * WebSocketManager — real-time price feeds + order flow via Binance streams.
+ *
+ * Subscribes per symbol to:
+ *   1. miniTicker  — last price, feeds the rolling tick buffer used by ScalpingEngine
+ *   2. aggTrade    — individual aggressor trades (buy vs sell volume) for CVD computation
  *
  * Uses the native WebSocket global (Node.js 22+ / tsconfig lib: DOM).
- * Maintains a rolling price buffer per symbol.
  * Auto-reconnects with exponential backoff.
  */
 
-const BINANCE_WS_BASE = 'wss://stream.binance.com:9443/ws';
-const BUFFER_SIZE      = 300;  // 5 min of 1s ticks at miniTicker rate
-const MIN_RECONNECT_MS = 1_000;
-const MAX_RECONNECT_MS = 30_000;
+const BINANCE_WS_BASE  = 'wss://stream.binance.com:9443/ws';
+const BUFFER_SIZE       = 300;   // 5 min of 1s ticks at miniTicker rate
+const MIN_RECONNECT_MS  = 1_000;
+const MAX_RECONNECT_MS  = 30_000;
+/** Rolling window for CVD accumulation (2 minutes). */
+const CVD_WINDOW_MS     = 120_000;
 
 interface MiniTickerMsg {
-  e: string;  // event type: '24hrMiniTicker'
-  s: string;  // symbol e.g. 'BTCUSDT'
-  c: string;  // close (last) price
+  e: string;  // '24hrMiniTicker'
+  s: string;  // 'BTCUSDT'
+  c: string;  // last price
+}
+
+interface AggTradeMsg {
+  e: string;  // 'aggTrade'
+  s: string;  // symbol
+  q: string;  // quantity (base asset)
+  m: boolean; // true = buyer is maker (sell aggressor), false = buy aggressor
 }
 
 interface SymbolState {
@@ -24,9 +36,24 @@ interface SymbolState {
   reconnectTimer: ReturnType<typeof setTimeout> | null;
 }
 
+/** Rolling trade-flow entry stored per aggTrade tick. */
+interface AggTradeEntry {
+  ts: number;       // epoch ms
+  buyVol: number;   // base qty if buy-aggressor, else 0
+  sellVol: number;  // base qty if sell-aggressor, else 0
+}
+
+interface AggTradeState {
+  entries: AggTradeEntry[];
+  ws: WebSocket | null;
+  reconnectDelay: number;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
+}
+
 export class WebSocketManager {
   private static instance: WebSocketManager | null = null;
-  private symbols = new Map<string, SymbolState>();
+  private symbols   = new Map<string, SymbolState>();
+  private aggTrades = new Map<string, AggTradeState>();
 
   private constructor() {}
 
@@ -38,33 +65,68 @@ export class WebSocketManager {
   // ── Public API ────────────────────────────────────────────────────────────
 
   /**
-   * Subscribe to a symbol's miniTicker stream.
-   * Optionally seed the buffer with historical prices from REST bootstrap.
+   * Subscribe to a symbol's miniTicker + aggTrade streams.
+   * Optionally seed the price buffer with historical prices from REST bootstrap.
    */
   subscribe(symbol: string, seedPrices?: number[]): void {
-    if (this.symbols.has(symbol)) return;
+    if (!this.symbols.has(symbol)) {
+      const state: SymbolState = {
+        buffer: seedPrices ? seedPrices.slice(-BUFFER_SIZE) : [],
+        ws: null,
+        reconnectDelay: MIN_RECONNECT_MS,
+        reconnectTimer: null,
+      };
+      this.symbols.set(symbol, state);
+      this.connect(symbol);
+    }
 
-    const state: SymbolState = {
-      buffer: seedPrices ? seedPrices.slice(-BUFFER_SIZE) : [],
-      ws: null,
-      reconnectDelay: MIN_RECONNECT_MS,
-      reconnectTimer: null,
-    };
-    this.symbols.set(symbol, state);
-    this.connect(symbol);
+    if (!this.aggTrades.has(symbol)) {
+      const aggState: AggTradeState = {
+        entries: [],
+        ws: null,
+        reconnectDelay: MIN_RECONNECT_MS,
+        reconnectTimer: null,
+      };
+      this.aggTrades.set(symbol, aggState);
+      this.connectAggTrade(symbol);
+    }
   }
 
   unsubscribe(symbol: string): void {
+    // miniTicker
     const state = this.symbols.get(symbol);
-    if (!state) return;
-    if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
-    if (state.ws) {
-      // Prevent reconnect loop by removing state before close fires
+    if (state) {
+      if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
       this.symbols.delete(symbol);
-      try { state.ws.close(); } catch { /* ignore */ }
-    } else {
-      this.symbols.delete(symbol);
+      if (state.ws) try { state.ws.close(); } catch { /* ignore */ }
     }
+    // aggTrade
+    const aggState = this.aggTrades.get(symbol);
+    if (aggState) {
+      if (aggState.reconnectTimer) clearTimeout(aggState.reconnectTimer);
+      this.aggTrades.delete(symbol);
+      if (aggState.ws) try { aggState.ws.close(); } catch { /* ignore */ }
+    }
+  }
+
+  /**
+   * Cumulative Volume Delta over the last `windowMs` milliseconds.
+   * cvd > 0 → buy pressure dominates; cvd < 0 → sell pressure dominates.
+   * Returns null if no aggTrade data is available for the symbol yet.
+   */
+  getCVD(symbol: string, windowMs = 30_000): { buyVol: number; sellVol: number; cvd: number } | null {
+    const aggState = this.aggTrades.get(symbol);
+    if (!aggState || aggState.entries.length === 0) return null;
+
+    const cutoff = Date.now() - windowMs;
+    let buyVol = 0;
+    let sellVol = 0;
+    for (const e of aggState.entries) {
+      if (e.ts < cutoff) continue;
+      buyVol  += e.buyVol;
+      sellVol += e.sellVol;
+    }
+    return { buyVol, sellVol, cvd: buyVol - sellVol };
   }
 
   getLatestPrice(symbol: string): number | null {
@@ -180,5 +242,72 @@ export class WebSocketManager {
     if (!state) return;
     state.buffer.push(price);
     if (state.buffer.length > BUFFER_SIZE) state.buffer.shift();
+  }
+
+  // ── aggTrade stream ───────────────────────────────────────────────────────
+
+  private connectAggTrade(symbol: string): void {
+    const aggState = this.aggTrades.get(symbol);
+    if (!aggState) return;
+
+    const url = `${BINANCE_WS_BASE}/${symbol.toLowerCase()}@aggTrade`;
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(url);
+    } catch {
+      this.scheduleReconnectAggTrade(symbol);
+      return;
+    }
+
+    aggState.ws = ws;
+
+    ws.onopen = () => {
+      aggState.reconnectDelay = MIN_RECONNECT_MS;
+    };
+
+    ws.onmessage = (event: MessageEvent) => {
+      try {
+        const msg = JSON.parse(event.data as string) as AggTradeMsg;
+        if (msg.e !== 'aggTrade') return;
+        const qty = parseFloat(msg.q);
+        if (!Number.isFinite(qty) || qty <= 0) return;
+
+        // m=false → buy aggressor (taker lifted the ask)
+        // m=true  → sell aggressor (taker hit the bid)
+        const entry: AggTradeEntry = {
+          ts:      Date.now(),
+          buyVol:  msg.m ? 0 : qty,
+          sellVol: msg.m ? qty : 0,
+        };
+        aggState.entries.push(entry);
+
+        // Evict entries older than CVD_WINDOW_MS (2× buffer to keep some history)
+        const cutoff = Date.now() - CVD_WINDOW_MS;
+        while (aggState.entries.length > 0 && aggState.entries[0].ts < cutoff) {
+          aggState.entries.shift();
+        }
+      } catch {
+        // ignore malformed
+      }
+    };
+
+    ws.onerror = () => { /* close fires next */ };
+
+    ws.onclose = () => {
+      aggState.ws = null;
+      if (this.aggTrades.has(symbol)) this.scheduleReconnectAggTrade(symbol);
+    };
+  }
+
+  private scheduleReconnectAggTrade(symbol: string): void {
+    const aggState = this.aggTrades.get(symbol);
+    if (!aggState) return;
+    if (aggState.reconnectTimer) clearTimeout(aggState.reconnectTimer);
+    const delay = aggState.reconnectDelay;
+    aggState.reconnectDelay = Math.min(delay * 2, MAX_RECONNECT_MS);
+    aggState.reconnectTimer = setTimeout(() => {
+      aggState.reconnectTimer = null;
+      this.connectAggTrade(symbol);
+    }, delay);
   }
 }

@@ -214,6 +214,27 @@ export class BinanceClient {
   }
 
   /**
+   * Fetch the current funding rate for a symbol from /fapi/v1/premiumIndex.
+   * Returns null on failure. Caller should cache the result (30-min TTL is typical).
+   */
+  async getFundingRate(symbol: string): Promise<number | null> {
+    if (!this.enabled) return null;
+
+    try {
+      const data = await this.signedGet('/fapi/v1/premiumIndex', { symbol }) as Record<string, unknown>;
+      const rate = parseFloat(String(data.lastFundingRate ?? data.fundingRate ?? ''));
+      if (!Number.isFinite(rate)) return null;
+      return rate;
+    } catch (err: unknown) {
+      const msg = axios.isAxiosError(err)
+        ? (err.response?.data as Record<string, unknown>)?.msg ?? err.message
+        : String(err);
+      console.error(`[BinanceClient] getFundingRate failed ${symbol}: ${msg}`);
+      return null;
+    }
+  }
+
+  /**
    * Set leverage for a symbol before first trade.
    * Silently skips on failure — default exchange leverage will be used.
    */
