@@ -3,10 +3,11 @@ import path from 'path';
 import type { Position } from '../Engine';
 import type { TradeLog } from '../types';
 
-const DATA_DIR = path.join(process.cwd(), 'data');
+const DATA_DIR = process.env.DATA_DIR?.trim() || path.join(process.cwd(), 'data');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const DEBOUNCE_MS = 200;
 const MAX_TRADES_PER_ENGINE = 500;
+const LIVE_TRADING_ENABLED = process.env.BINANCE_ENABLED === 'true';
 
 /** Per-engine persisted slice (swing / scalp). */
 export interface EngineStateSnapshot {
@@ -33,6 +34,13 @@ function freshState(): PersistedState {
     swing: { tradeHistory: [], activePositions: [] },
     scalp: { tradeHistory: [], activePositions: [] },
   };
+}
+
+function refuseFreshLiveState(reason: string): never {
+  throw new Error(
+    `[STATE] Refusing to start with fresh empty state while BINANCE_ENABLED=true (${reason}). ` +
+      `Configure DATA_DIR to a persistent disk and restore ${STATE_FILE}.`
+  );
 }
 
 function normalizeEngine(e: Partial<EngineStateSnapshot> | null | undefined): EngineStateSnapshot {
@@ -163,9 +171,11 @@ function validatePersisted(raw: unknown): PersistedState | null {
 }
 
 /**
- * Load persisted trading state. Never throws: corrupted / missing → migrate or fresh defaults.
+ * Load persisted trading state. In live trading, missing/invalid state is fatal so
+ * deploys cannot silently erase trade history or forget open positions.
  */
 export async function loadState(): Promise<PersistedState> {
+  let fallbackReason = 'state.json missing';
   try {
     const raw = await fs.readFile(STATE_FILE, 'utf8');
     const parsed = JSON.parse(raw) as unknown;
@@ -182,10 +192,12 @@ export async function loadState(): Promise<PersistedState> {
       );
       return normalized;
     }
+    fallbackReason = 'state.json invalid or incomplete shape';
     console.warn('[STATE] state.json invalid or incomplete shape — fallback / migrate');
   } catch (e: unknown) {
     const err = e as NodeJS.ErrnoException;
     if (err?.code !== 'ENOENT') {
+      fallbackReason = 'state.json unreadable or corrupted';
       console.warn('[STATE] state.json unreadable or corrupted — fallback / migrate:', e);
     }
   }
@@ -195,6 +207,10 @@ export async function loadState(): Promise<PersistedState> {
     const { open, closed } = tradeCounts(migrated);
     console.log(`[STATE] Loaded balance=${migrated.balance.toFixed(2)} open=${open} closed=${closed}`);
     return migrated;
+  }
+
+  if (LIVE_TRADING_ENABLED) {
+    refuseFreshLiveState(fallbackReason);
   }
 
   const fresh = freshState();
