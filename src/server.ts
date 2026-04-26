@@ -17,6 +17,7 @@ import { exchange } from './backend/exchange/BinanceClient.ts';
 import { runBacktest } from './backend/backtest/BacktestRunner.ts';
 import { classifyWatchlistTicks } from './backend/watchlistTickClassify.ts';
 import type { TradeLog } from './backend/types.ts';
+import { PerformanceAnalyzer } from './backend/evolution/PerformanceAnalyzer.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -291,6 +292,18 @@ async function startServer() {
     };
 
     res.json({ combined, swing: swingStats, scalp: scalpStats });
+  });
+
+  app.get('/api/performance/versions', (req, res) => {
+    try {
+      const swingStatus = swingEngine.getStatus();
+      const scalpStatus = scalpEngine.getStatus();
+      const trades = buildTradeAuditList(swingStatus, scalpStatus);
+      res.json({ versions: PerformanceAnalyzer.analyzeByVersion(trades) });
+    } catch (e) {
+      console.error('[api/performance/versions]', e);
+      res.status(500).json({ error: String(e) });
+    }
   });
 
   app.post('/api/backtest', async (req, res) => {

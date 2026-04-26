@@ -1,5 +1,8 @@
 export interface TradeLog {
   id: string;
+  strategyVersionId: string;
+  parameterSetId: string;
+  experimentId?: string;
   symbol: string;
   side: 'LONG' | 'SHORT';
   source: 'swing' | 'scalp'; // which engine opened this trade

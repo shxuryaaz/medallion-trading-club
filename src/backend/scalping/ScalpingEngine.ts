@@ -23,6 +23,7 @@ import {
   plannedRewardUsd,
   plannedRiskReward,
 } from '../TradeLog';
+import { StrategyVersionManager } from '../evolution/StrategyVersionManager';
 
 // ── Indicator helpers (inlined — no dependency on swing engine math) ──────────
 
@@ -1147,9 +1148,12 @@ export class ScalpingEngine {
     const rewardUsd = plannedRewardUsd(order.avgPrice, fillTp, order.executedQty);
     const rewardRisk = plannedRiskReward(actualRiskAmt, rewardUsd);
     const createdAt = Date.now();
+    const activeVersion = await StrategyVersionManager.getActiveVersion(ENGINE_ID);
 
     const trade: TradeLog = {
       id:         tradeId,
+      strategyVersionId: activeVersion.strategyVersionId,
+      parameterSetId: activeVersion.parameterSetId,
       symbol,
       side,
       source:     'scalp',

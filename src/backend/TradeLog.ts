@@ -13,6 +13,9 @@ export type TradeExitReason = 'TP' | 'SL' | 'MANUAL' | 'ERROR';
 
 export interface TradeLog {
   id: string;
+  strategyVersionId: string;
+  parameterSetId: string;
+  experimentId?: string;
   symbol: string;
   side: 'LONG' | 'SHORT';
   source: TradeSource;

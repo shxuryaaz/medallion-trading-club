@@ -27,6 +27,7 @@ import {
   plannedRewardUsd,
   plannedRiskReward,
 } from './TradeLog';
+import { StrategyVersionManager } from './evolution/StrategyVersionManager';
 
 export type { TradeLog } from './types';
 
@@ -465,9 +466,12 @@ export class TradingSystem {
     const rewardUsd = plannedRewardUsd(position.entryPrice, position.takeProfit, position.amount);
     const rewardRisk = plannedRiskReward(initialRisk, rewardUsd);
     const createdAt = Date.now();
+    const activeVersion = await StrategyVersionManager.getActiveVersion(ENGINE_ID);
 
     const trade: TradeLog = {
       id: tradeId,
+      strategyVersionId: activeVersion.strategyVersionId,
+      parameterSetId: activeVersion.parameterSetId,
       symbol,
       side,
       source: 'swing',
