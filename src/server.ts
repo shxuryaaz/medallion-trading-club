@@ -241,6 +241,40 @@ async function startServer() {
     }
   });
 
+  app.get('/api/binance/user-trades', async (req, res) => {
+    const symbol = typeof req.query.symbol === 'string' ? req.query.symbol.toUpperCase() : '';
+    if (!symbol) {
+      return res.status(400).json({ error: 'symbol query param is required' });
+    }
+
+    const parseOptionalMs = (value: unknown): number | undefined => {
+      if (typeof value !== 'string' || value.length === 0) return undefined;
+      const n = Number(value);
+      return Number.isFinite(n) ? n : undefined;
+    };
+
+    try {
+      const trades = await exchange.getRecentUserTrades({
+        symbol,
+        startTime: parseOptionalMs(req.query.startTime),
+        endTime: parseOptionalMs(req.query.endTime),
+        limit:
+          typeof req.query.limit === 'string' && Number.isFinite(Number(req.query.limit))
+            ? Number(req.query.limit)
+            : undefined,
+      });
+      res.json({
+        symbol,
+        trades,
+        note:
+          'Raw Binance futures fills include exchange price/qty/fees/realizedPnl, but not bot-only fields like planned SL/TP or strategy reason.',
+      });
+    } catch (e) {
+      console.error('[api/binance/user-trades]', e);
+      res.status(500).json({ error: String(e) });
+    }
+  });
+
   app.get('/api/performance', (req, res) => {
     const swingStats = swingEngine.getPerformanceStats();
     const scalpStats = scalpEngine.getPerformanceStats();

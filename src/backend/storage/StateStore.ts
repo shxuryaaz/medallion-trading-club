@@ -8,6 +8,9 @@ const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const DEBOUNCE_MS = 200;
 const MAX_TRADES_PER_ENGINE = 500;
 const LIVE_TRADING_ENABLED = process.env.BINANCE_ENABLED === 'true';
+const REQUIRE_PERSISTED_STATE_ON_LIVE =
+  process.env.REQUIRE_PERSISTED_STATE === 'true' ||
+  process.env.REQUIRE_PERSISTED_STATE_ON_LIVE === 'true';
 
 /** Per-engine persisted slice (swing / scalp). */
 export interface EngineStateSnapshot {
@@ -36,10 +39,11 @@ function freshState(): PersistedState {
   };
 }
 
-function refuseFreshLiveState(reason: string): never {
-  throw new Error(
-    `[STATE] Refusing to start with fresh empty state while BINANCE_ENABLED=true (${reason}). ` +
-      `Configure DATA_DIR to a persistent disk and restore ${STATE_FILE}.`
+function warnFreshLiveState(reason: string): void {
+  console.warn(
+    `[STATE] WARNING: starting with fresh empty state while BINANCE_ENABLED=true (${reason}). ` +
+      `Trading will continue, but local trade history/open-position memory may be incomplete. ` +
+      `Configure DATA_DIR to durable storage when available. stateFile=${STATE_FILE}`
   );
 }
 
@@ -171,8 +175,9 @@ function validatePersisted(raw: unknown): PersistedState | null {
 }
 
 /**
- * Load persisted trading state. In live trading, missing/invalid state is fatal so
- * deploys cannot silently erase trade history or forget open positions.
+ * Load persisted trading state. Missing state stays non-fatal by default so free
+ * ephemeral hosts can keep trading; set REQUIRE_PERSISTED_STATE_ON_LIVE=true to
+ * make missing/invalid live state fatal.
  */
 export async function loadState(): Promise<PersistedState> {
   let fallbackReason = 'state.json missing';
@@ -210,7 +215,13 @@ export async function loadState(): Promise<PersistedState> {
   }
 
   if (LIVE_TRADING_ENABLED) {
-    refuseFreshLiveState(fallbackReason);
+    if (REQUIRE_PERSISTED_STATE_ON_LIVE) {
+      throw new Error(
+        `[STATE] Refusing to start with fresh empty state while BINANCE_ENABLED=true (${fallbackReason}). ` +
+          `Configure DATA_DIR to durable storage and restore ${STATE_FILE}, or unset REQUIRE_PERSISTED_STATE_ON_LIVE.`
+      );
+    }
+    warnFreshLiveState(fallbackReason);
   }
 
   const fresh = freshState();

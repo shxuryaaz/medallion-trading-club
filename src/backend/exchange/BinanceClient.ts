@@ -42,6 +42,23 @@ export interface OrderResult {
   executedQty: number;
 }
 
+export interface BinanceUserTrade {
+  id: number;
+  orderId: number;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  price: number;
+  qty: number;
+  quoteQty: number;
+  realizedPnl: number;
+  commission: number;
+  commissionAsset: string;
+  time: number;
+  buyer: boolean;
+  maker: boolean;
+  positionSide: string;
+}
+
 function parseNumber(value: unknown): number {
   const n = typeof value === 'number' ? value : parseFloat(String(value ?? ''));
   return Number.isFinite(n) ? n : 0;
@@ -84,6 +101,49 @@ function parseOrderResult(data: Record<string, unknown>): OrderResult | null {
     return null;
   }
   return { orderId, avgPrice, executedQty };
+}
+
+function parseUserTrade(raw: Record<string, unknown>): BinanceUserTrade | null {
+  const id = Number(raw.id);
+  const orderId = Number(raw.orderId);
+  const symbol = String(raw.symbol ?? '');
+  const sideRaw = String(raw.side ?? '');
+  const side = sideRaw === 'BUY' || sideRaw === 'SELL' ? sideRaw : null;
+  const price = parseNumber(raw.price);
+  const qty = parseNumber(raw.qty);
+  const quoteQty = parseNumber(raw.quoteQty);
+  const realizedPnl = parseNumber(raw.realizedPnl);
+  const commission = parseNumber(raw.commission);
+  const time = Number(raw.time);
+
+  if (
+    !Number.isFinite(id) ||
+    !Number.isFinite(orderId) ||
+    !symbol ||
+    side == null ||
+    price <= 0 ||
+    qty <= 0 ||
+    !Number.isFinite(time)
+  ) {
+    return null;
+  }
+
+  return {
+    id,
+    orderId,
+    symbol,
+    side,
+    price,
+    qty,
+    quoteQty,
+    realizedPnl,
+    commission,
+    commissionAsset: String(raw.commissionAsset ?? ''),
+    time,
+    buyer: Boolean(raw.buyer),
+    maker: Boolean(raw.maker),
+    positionSide: String(raw.positionSide ?? 'BOTH'),
+  };
 }
 
 export class BinanceClient {
@@ -284,6 +344,47 @@ export class BinanceClient {
         : String(err);
       console.error(`[BinanceClient] getFundingRate failed ${symbol}: ${msg}`);
       return null;
+    }
+  }
+
+  /**
+   * Fetch recent account fills from Binance USDT-M Futures.
+   * This is raw exchange history: it can recover fills/PnL/fees, but not bot-only
+   * fields such as strategy reason, planned SL/TP, or R unless those were logged locally.
+   */
+  async getRecentUserTrades(params: {
+    symbol: string;
+    startTime?: number;
+    endTime?: number;
+    limit?: number;
+  }): Promise<BinanceUserTrade[]> {
+    if (!this.enabled) return [];
+
+    const limit = Math.min(1000, Math.max(1, params.limit ?? 100));
+    const req: Record<string, string | number> = {
+      symbol: params.symbol.toUpperCase(),
+      limit,
+    };
+    if (typeof params.startTime === 'number' && Number.isFinite(params.startTime)) {
+      req.startTime = Math.floor(params.startTime);
+    }
+    if (typeof params.endTime === 'number' && Number.isFinite(params.endTime)) {
+      req.endTime = Math.floor(params.endTime);
+    }
+
+    try {
+      const data = await this.signedGet('/fapi/v1/userTrades', req);
+      if (!Array.isArray(data)) return [];
+      return data
+        .map((row) => (typeof row === 'object' && row !== null ? parseUserTrade(row as Record<string, unknown>) : null))
+        .filter((row): row is BinanceUserTrade => row !== null)
+        .sort((a, b) => b.time - a.time);
+    } catch (err: unknown) {
+      const msg = axios.isAxiosError(err)
+        ? (err.response?.data as Record<string, unknown>)?.msg ?? err.message
+        : String(err);
+      console.error(`[BinanceClient] getRecentUserTrades failed ${params.symbol}: ${msg}`);
+      return [];
     }
   }
 
