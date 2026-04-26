@@ -18,9 +18,14 @@ import {
   DAILY_LOSS_LIMIT_FRAC,
   MAX_ENTRY_LATENCY_MS,
   MAX_ENTRY_SLIPPAGE_BPS,
+  appendTradeClosed,
+  appendTradeOpened,
   appendTradeTelemetry,
   entrySlippageBps,
   exitSlippageBps,
+  mapExitReason,
+  plannedRewardUsd,
+  plannedRiskReward,
 } from './TradeLog';
 
 export type { TradeLog } from './types';
@@ -456,21 +461,31 @@ export class TradingSystem {
 
     this.activePositions.push(position);
 
+    const initialRisk = riskAtStop(position);
+    const rewardUsd = plannedRewardUsd(position.entryPrice, position.takeProfit, position.amount);
+    const rewardRisk = plannedRiskReward(initialRisk, rewardUsd);
+    const createdAt = Date.now();
+
     const trade: TradeLog = {
       id: tradeId,
+      symbol,
+      side,
+      source: 'swing',
+      status: 'OPEN',
       signalPrice: price,
       signalTimestamp,
       fillPrice: order.avgPrice,
       entrySlippageBps: slippageBps,
       latencyMs,
-      initialRiskUsd: riskAtStop(position),
-      symbol,
-      side,
+      plannedStopLoss: position.stopLoss,
+      plannedTakeProfit: position.takeProfit,
+      initialRiskUsd: initialRisk,
+      plannedRewardUsd: rewardUsd,
+      plannedRiskReward: rewardRisk,
+      createdAt,
       entryPrice: order.avgPrice,
       amount: order.executedQty,
-      status: 'OPEN',
-      timestamp: Date.now(),
-      source: 'swing',
+      timestamp: createdAt,
     };
     this.tradeHistory.push(trade);
 
@@ -479,6 +494,19 @@ export class TradingSystem {
 
     this.persistState();
     this.lastTradeOpenedAt = Date.now();
+    appendTradeOpened({
+      event: 'TRADE_OPENED',
+      tradeId,
+      symbol,
+      source: 'swing',
+      side,
+      signalPrice: price,
+      fillPrice: order.avgPrice,
+      plannedStopLoss: position.stopLoss,
+      plannedTakeProfit: position.takeProfit,
+      plannedRiskReward: rewardRisk,
+      entrySlippageBps: slippageBps,
+    }).catch((err) => this.addLog(`ERROR trade-open audit append failed: ${(err as Error).message}`));
     const guardNote = guardRejected ? ' guard_rejected_flatten_failed=true' : '';
     this.addLog(`OPEN ${side} ${symbol} @ ${order.avgPrice} (signal=${price} slip=${slippageBps.toFixed(2)}bps tradeId=${tradeId})${guardNote}`);
   }
@@ -553,10 +581,24 @@ export class TradingSystem {
     trade.exitFee       = exitFee;
     trade.netPnl        = netPnl;
     trade.pnl           = netPnl;
+    trade.feesUsd       = entryFee + exitFee;
+    trade.netPnlUsd     = netPnl;
+    trade.exitReason    = mapExitReason(reason);
     trade.exitSlippageBps = exitSlip;
     trade.R             = realizedR;
     trade.status        = 'CLOSED';
-    trade.exitTimestamp = Date.now();
+    trade.closedAt      = Date.now();
+    trade.exitTimestamp = trade.closedAt;
+
+    appendTradeClosed({
+      event: 'TRADE_CLOSED',
+      tradeId: trade.id,
+      exitPrice: closePrice,
+      exitReason: trade.exitReason,
+      feesUsd: trade.feesUsd,
+      netPnlUsd: netPnl,
+      R: realizedR,
+    }).catch((err) => this.addLog(`ERROR trade-close audit append failed: ${(err as Error).message}`));
 
     appendTradeTelemetry({
       tradeId: trade.id,

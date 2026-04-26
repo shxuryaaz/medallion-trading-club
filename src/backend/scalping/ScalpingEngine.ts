@@ -14,9 +14,14 @@ import {
   DAILY_LOSS_LIMIT_FRAC,
   MAX_ENTRY_LATENCY_MS,
   MAX_ENTRY_SLIPPAGE_BPS,
+  appendTradeClosed,
+  appendTradeOpened,
   appendTradeTelemetry,
   entrySlippageBps,
   exitSlippageBps,
+  mapExitReason,
+  plannedRewardUsd,
+  plannedRiskReward,
 } from '../TradeLog';
 
 // ── Indicator helpers (inlined — no dependency on swing engine math) ──────────
@@ -1139,21 +1144,30 @@ export class ScalpingEngine {
       exchangeOrderId: order.orderId,
     };
 
+    const rewardUsd = plannedRewardUsd(order.avgPrice, fillTp, order.executedQty);
+    const rewardRisk = plannedRiskReward(actualRiskAmt, rewardUsd);
+    const createdAt = Date.now();
+
     const trade: TradeLog = {
       id:         tradeId,
       symbol,
       side,
+      source:     'scalp',
+      status:     'OPEN',
       signalPrice: price,
       signalTimestamp,
       fillPrice: order.avgPrice,
       entrySlippageBps: slipBps,
       latencyMs,
+      plannedStopLoss: fillSl,
+      plannedTakeProfit: fillTp,
       initialRiskUsd: actualRiskAmt,
+      plannedRewardUsd: rewardUsd,
+      plannedRiskReward: rewardRisk,
+      createdAt,
       entryPrice: order.avgPrice,
       amount: order.executedQty,
-      status:     'OPEN',
-      timestamp:  Date.now(),
-      source:     'scalp',
+      timestamp:  createdAt,
       scalpEntryQuality: {
         score: entryQuality.score,
         momentumStrength: entryQuality.momentumStrength,
@@ -1162,7 +1176,7 @@ export class ScalpingEngine {
       scalpRiskReward: {
         slDistance: fillSlDist,
         tpDistance: tpDist,
-        riskReward: fillSlDist > 0 ? Math.abs(fillTp - order.avgPrice) / fillSlDist : riskReward,
+        riskReward: rewardRisk,
       },
     };
 
@@ -1173,10 +1187,23 @@ export class ScalpingEngine {
     this.lastTradeOpenedAt = Date.now();
 
     this.persistState();
+    appendTradeOpened({
+      event: 'TRADE_OPENED',
+      tradeId,
+      symbol,
+      source: 'scalp',
+      side,
+      signalPrice: price,
+      fillPrice: order.avgPrice,
+      plannedStopLoss: fillSl,
+      plannedTakeProfit: fillTp,
+      plannedRiskReward: rewardRisk,
+      entrySlippageBps: slipBps,
+    }).catch((err) => this.addLog(`ERROR trade-open audit append failed: ${(err as Error).message}`));
     this.addLog(
       `OPEN ${side} ${symbol} @ ${order.avgPrice.toFixed(4)} signal=${price.toFixed(4)} slip=${slipBps.toFixed(2)}bps ` +
       `SL=${fillSl.toFixed(4)} TP=${fillTp.toFixed(4)} ` +
-      `slDist=${fillSlDist.toFixed(6)} tpDist=${Math.abs(fillTp - order.avgPrice).toFixed(6)} R:R=${(fillSlDist > 0 ? Math.abs(fillTp - order.avgPrice) / fillSlDist : riskReward).toFixed(2)} ` +
+      `slDist=${fillSlDist.toFixed(6)} tpDist=${Math.abs(fillTp - order.avgPrice).toFixed(6)} R:R=${rewardRisk.toFixed(2)} ` +
       `size=${notional.toFixed(2)}$(${SCALP_LEVERAGE}x) scale=${scale.toFixed(2)} ` +
       `score=${entryQuality.score} momStr=${entryQuality.momentumStrength.toExponential(2)} ` +
       `volShort=${entryQuality.volShort.toExponential(2)} | ${signalReason}`
@@ -1214,10 +1241,24 @@ export class ScalpingEngine {
       trade.exitFee       = exitFee;
       trade.netPnl        = netPnl;
       trade.pnl           = netPnl;
+      trade.feesUsd       = entryFee + exitFee;
+      trade.netPnlUsd     = netPnl;
+      trade.exitReason    = mapExitReason(reason);
       trade.exitSlippageBps = exitSlip;
       trade.R             = realizedR;
       trade.status        = 'CLOSED';
-      trade.exitTimestamp = Date.now();
+      trade.closedAt      = Date.now();
+      trade.exitTimestamp = trade.closedAt;
+
+      appendTradeClosed({
+        event: 'TRADE_CLOSED',
+        tradeId: trade.id,
+        exitPrice: closePrice,
+        exitReason: trade.exitReason,
+        feesUsd: trade.feesUsd,
+        netPnlUsd: netPnl,
+        R: realizedR,
+      }).catch((err) => this.addLog(`ERROR trade-close audit append failed: ${(err as Error).message}`));
 
       appendTradeTelemetry({
         tradeId: trade.id,
