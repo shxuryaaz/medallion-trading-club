@@ -1,5 +1,11 @@
 export interface TradeLog {
   id: string;
+  signalPrice?: number;
+  signalTimestamp?: number;
+  fillPrice?: number;
+  entrySlippageBps?: number;
+  latencyMs?: number;
+  initialRiskUsd?: number;
   symbol: string;
   side: 'LONG' | 'SHORT';
   entryPrice: number;
@@ -11,6 +17,8 @@ export interface TradeLog {
   netPnl?: number;
   entryFee?: number;
   exitFee?: number;
+  exitSlippageBps?: number;
+  R?: number;
   status: 'OPEN' | 'CLOSED';
   timestamp: number;
   exitTimestamp?: number;

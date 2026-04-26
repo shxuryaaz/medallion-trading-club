@@ -39,6 +39,51 @@ function buildSignature(params: Record<string, string | number>, secret: string)
 export interface OrderResult {
   orderId: number;
   avgPrice: number;
+  executedQty: number;
+}
+
+function parseNumber(value: unknown): number {
+  const n = typeof value === 'number' ? value : parseFloat(String(value ?? ''));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function parseOrderResult(data: Record<string, unknown>): OrderResult | null {
+  const orderId = Number(data.orderId);
+  let executedQty = parseNumber(data.executedQty);
+  let avgPrice = parseNumber(data.avgPrice);
+
+  if (avgPrice <= 0) {
+    avgPrice = parseNumber(data.price);
+  }
+
+  const cumQuote = parseNumber(data.cumQuote);
+  if (avgPrice <= 0 && executedQty > 0 && cumQuote > 0) {
+    avgPrice = cumQuote / executedQty;
+  }
+
+  const fills = Array.isArray(data.fills) ? data.fills : [];
+  if ((avgPrice <= 0 || executedQty <= 0) && fills.length > 0) {
+    let fillQty = 0;
+    let fillQuote = 0;
+    for (const raw of fills) {
+      if (typeof raw !== 'object' || raw === null) continue;
+      const fill = raw as Record<string, unknown>;
+      const qty = parseNumber(fill.qty ?? fill.quantity);
+      const price = parseNumber(fill.price);
+      if (qty <= 0 || price <= 0) continue;
+      fillQty += qty;
+      fillQuote += qty * price;
+    }
+    if (fillQty > 0) {
+      executedQty = executedQty > 0 ? executedQty : fillQty;
+      avgPrice = avgPrice > 0 ? avgPrice : fillQuote / fillQty;
+    }
+  }
+
+  if (!Number.isFinite(orderId) || orderId <= 0 || executedQty <= 0 || avgPrice <= 0) {
+    return null;
+  }
+  return { orderId, avgPrice, executedQty };
 }
 
 export class BinanceClient {
@@ -114,7 +159,7 @@ export class BinanceClient {
 
   /**
    * Place a market entry order.
-   * Returns orderId + avgPrice on success, null on failure (system stays in paper mode).
+   * Returns confirmed fill details on success, null on failure.
    */
   async placeMarketOrder(
     symbol: string,
@@ -135,14 +180,18 @@ export class BinanceClient {
         side,
         type: 'MARKET',
         quantity: String(qty),
+        newOrderRespType: 'RESULT',
       }) as Record<string, unknown>;
 
-      const orderId  = Number(data.orderId);
-      const avgPrice = parseFloat(String(data.avgPrice ?? data.price ?? '0'));
+      const result = parseOrderResult(data);
+      if (!result) {
+        console.error(`[BinanceClient] placeMarketOrder: invalid fill response for ${symbol}`);
+        return null;
+      }
       console.log(
-        `[BinanceClient] OPEN ${side} ${symbol} qty=${qty} orderId=${orderId} avgPrice=${avgPrice}`
+        `[BinanceClient] OPEN ${side} ${symbol} qty=${result.executedQty} orderId=${result.orderId} avgPrice=${result.avgPrice}`
       );
-      return { orderId, avgPrice };
+      return result;
     } catch (err: unknown) {
       const msg = axios.isAxiosError(err)
         ? (err.response?.data as Record<string, unknown>)?.msg ?? err.message
@@ -154,7 +203,7 @@ export class BinanceClient {
 
   /**
    * Close an existing position with a reduceOnly market order.
-   * Returns fill price on success, null on failure (caller falls back to last known price).
+   * Returns confirmed fill details on success, null on failure.
    */
   async closePosition(
     symbol: string,
@@ -174,14 +223,18 @@ export class BinanceClient {
         type: 'MARKET',
         quantity: String(qty),
         reduceOnly: 'true',
+        newOrderRespType: 'RESULT',
       }) as Record<string, unknown>;
 
-      const orderId  = Number(data.orderId);
-      const avgPrice = parseFloat(String(data.avgPrice ?? data.price ?? '0'));
+      const result = parseOrderResult(data);
+      if (!result) {
+        console.error(`[BinanceClient] closePosition: invalid fill response for ${symbol}`);
+        return null;
+      }
       console.log(
-        `[BinanceClient] CLOSE ${side} ${symbol} qty=${qty} orderId=${orderId} avgPrice=${avgPrice}`
+        `[BinanceClient] CLOSE ${side} ${symbol} qty=${result.executedQty} orderId=${result.orderId} avgPrice=${result.avgPrice}`
       );
-      return { orderId, avgPrice };
+      return result;
     } catch (err: unknown) {
       const msg = axios.isAxiosError(err)
         ? (err.response?.data as Record<string, unknown>)?.msg ?? err.message

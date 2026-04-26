@@ -10,6 +10,14 @@ import { StateStore, type EngineStateSnapshot } from '../persistence/StateStore'
 import { closedTradeNetAmount, entryExitFees, feeOnNotional, minTpDistanceForFees } from '../fees';
 import { DEFAULT_WATCHLIST_PANEL_SYMBOLS } from '../../constants/watchlistPanel.ts';
 import { exchange } from '../exchange/BinanceClient';
+import {
+  DAILY_LOSS_LIMIT_FRAC,
+  MAX_ENTRY_LATENCY_MS,
+  MAX_ENTRY_SLIPPAGE_BPS,
+  appendTradeTelemetry,
+  entrySlippageBps,
+  exitSlippageBps,
+} from '../TradeLog';
 
 // ── Indicator helpers (inlined — no dependency on swing engine math) ──────────
 
@@ -290,6 +298,7 @@ function shortenScalpReason(reason: string, maxLen = 40): string {
 export class ScalpingEngine {
   private readonly portfolio: PortfolioManager;
   private readonly ws: WebSocketManager;
+  private readonly startingBalance: number;
 
   private isRunning = false;
   private activePositions: Position[] = [];
@@ -323,6 +332,7 @@ export class ScalpingEngine {
   ) {
     this.portfolio = portfolio;
     this.ws        = ws;
+    this.startingBalance = portfolio.getBalance();
 
     const snap = initialSnapshot ?? null;
     if (snap) {
@@ -859,7 +869,7 @@ export class ScalpingEngine {
       }
 
       const price = this.ws.getLatestPrice(symbol)!;
-      this.openTrade(symbol, price, entry.side, entry.reason, ctx.ohlcv, {
+      await this.openTrade(symbol, price, entry.side, entry.reason, ctx.ohlcv, {
         score: entry.score,
         momentumStrength: entry.momentumStrength,
         volShort: entry.volShort,
@@ -994,14 +1004,23 @@ export class ScalpingEngine {
 
   // ── Trade execution ───────────────────────────────────────────────────────
 
-  private openTrade(
+  private async openTrade(
     symbol: string,
     price: number,
     side: 'LONG' | 'SHORT',
     signalReason: string,
     ohlcv: OHLCV[],
     entryQuality: { score: number; momentumStrength: number; volShort: number }
-  ): void {
+  ): Promise<void> {
+    if (this.startingBalance > 0) {
+      const dailyPnl = this.portfolio.getBalance() - this.startingBalance;
+      if (dailyPnl <= -this.startingBalance * DAILY_LOSS_LIMIT_FRAC) {
+        this.addLog(`SKIP ${symbol} ${side} cause=daily_loss_limit pnl=${dailyPnl.toFixed(2)}`);
+        return;
+      }
+    }
+
+    const signalTimestamp = Date.now();
     const atr = computeATR(ohlcv, ATR_PERIOD_SCALP);
     if (atr == null || atr <= 0) {
       this.addLog(`SKIP ${symbol} ${side} cause=atr_unavailable`);
@@ -1067,29 +1086,71 @@ export class ScalpingEngine {
       return;
     }
 
+    if (allocation.riskAllocated < riskAmt) {
+      this.addLog(
+        `SKIP ${symbol} ${side} cause=partial_risk_allocation(request=${riskAmt.toFixed(2)} approved=${allocation.riskAllocated.toFixed(2)})`
+      );
+      return;
+    }
+
+    await exchange.setLeverage(symbol, SCALP_LEVERAGE)
+      .catch(() => { /* default leverage used on failure */ });
+
+    const order = await exchange.placeMarketOrder(symbol, side === 'LONG' ? 'BUY' : 'SELL', amount);
+    if (!order) {
+      this.addLog(`SKIP ${symbol} ${side} cause=order_failed`);
+      return;
+    }
+
+    const latencyMs = Date.now() - signalTimestamp;
+    const slipBps = entrySlippageBps(side, price, order.avgPrice);
+    if (latencyMs > MAX_ENTRY_LATENCY_MS || slipBps > MAX_ENTRY_SLIPPAGE_BPS) {
+      const cause = latencyMs > MAX_ENTRY_LATENCY_MS
+        ? `latency(${latencyMs}ms)`
+        : `entry_slippage(${slipBps.toFixed(2)}bps)`;
+      const flattened = await exchange.closePosition(symbol, side, order.executedQty);
+      this.addLog(
+        `SKIP ${symbol} ${side} cause=${cause}; ` +
+        `entry_order=${order.orderId} flatten=${flattened ? 'ok' : 'failed'}`
+      );
+      if (flattened) return;
+    }
+
     const tradeId = randomUUID();
+    const fillOffset = order.avgPrice - price;
+    const fillSl = sl + fillOffset;
+    const fillTp = tp + fillOffset;
+    const fillSlDist = Math.abs(order.avgPrice - fillSl);
+    const actualRiskAmt = fillSlDist * order.executedQty;
 
     const position: Position = {
       tradeId,
       symbol,
-      entryPrice:    price,
-      currentPrice:  price,
+      entryPrice:    order.avgPrice,
+      currentPrice:  order.avgPrice,
       unrealizedPnl: 0,
-      amount,
+      amount:        order.executedQty,
       side,
-      stopLoss:      sl,
-      takeProfit:    tp,
+      stopLoss:      fillSl,
+      takeProfit:    fillTp,
       timestamp:     Date.now(),
-      initialStopDist: slDist,
+      initialStopDist: fillSlDist,
       engineId:      ENGINE_ID,
+      exchangeOrderId: order.orderId,
     };
 
     const trade: TradeLog = {
       id:         tradeId,
       symbol,
       side,
-      entryPrice: price,
-      amount,
+      signalPrice: price,
+      signalTimestamp,
+      fillPrice: order.avgPrice,
+      entrySlippageBps: slipBps,
+      latencyMs,
+      initialRiskUsd: actualRiskAmt,
+      entryPrice: order.avgPrice,
+      amount: order.executedQty,
       status:     'OPEN',
       timestamp:  Date.now(),
       source:     'scalp',
@@ -1099,31 +1160,23 @@ export class ScalpingEngine {
         volShort: entryQuality.volShort,
       },
       scalpRiskReward: {
-        slDistance: slDist,
+        slDistance: fillSlDist,
         tpDistance: tpDist,
-        riskReward,
+        riskReward: fillSlDist > 0 ? Math.abs(fillTp - order.avgPrice) / fillSlDist : riskReward,
       },
     };
 
-    // Register with portfolio (synchronous — no await between requestCapital and here)
-    this.portfolio.registerTrade(ENGINE_ID, tradeId, symbol, riskAmt);
+    this.portfolio.registerTrade(ENGINE_ID, tradeId, symbol, actualRiskAmt);
 
     this.activePositions.push(position);
     this.tradeHistory.push(trade);
     this.lastTradeOpenedAt = Date.now();
 
-    // Set leverage then place order (fire-and-forget — does not block local position registration)
-    exchange.setLeverage(symbol, SCALP_LEVERAGE)
-      .catch(() => { /* default leverage used on failure */ });
-    exchange.placeMarketOrder(symbol, side === 'LONG' ? 'BUY' : 'SELL', amount)
-      .then(r => { if (r) position.exchangeOrderId = r.orderId; })
-      .catch(err => this.addLog(`[Exchange] Entry order failed: ${(err as Error).message}`));
-
     this.persistState();
     this.addLog(
-      `OPEN ${side} ${symbol} @ ${price.toFixed(4)} ` +
-      `SL=${sl.toFixed(4)} TP=${tp.toFixed(4)} ` +
-      `slDist=${slDist.toFixed(6)} tpDist=${tpDist.toFixed(6)} R:R=${riskReward.toFixed(2)} ` +
+      `OPEN ${side} ${symbol} @ ${order.avgPrice.toFixed(4)} signal=${price.toFixed(4)} slip=${slipBps.toFixed(2)}bps ` +
+      `SL=${fillSl.toFixed(4)} TP=${fillTp.toFixed(4)} ` +
+      `slDist=${fillSlDist.toFixed(6)} tpDist=${Math.abs(fillTp - order.avgPrice).toFixed(6)} R:R=${(fillSlDist > 0 ? Math.abs(fillTp - order.avgPrice) / fillSlDist : riskReward).toFixed(2)} ` +
       `size=${notional.toFixed(2)}$(${SCALP_LEVERAGE}x) scale=${scale.toFixed(2)} ` +
       `score=${entryQuality.score} momStr=${entryQuality.momentumStrength.toExponential(2)} ` +
       `volShort=${entryQuality.volShort.toExponential(2)} | ${signalReason}`
@@ -1133,10 +1186,13 @@ export class ScalpingEngine {
   private async closePosition(index: number, price: number, reason: string): Promise<void> {
     const pos = this.activePositions[index];
 
-    // Attempt live close on exchange; use actual fill price if available
-    let closePrice = price;
+    // Attempt live close on exchange; keep the position open if reduce-only fails.
     const result = await exchange.closePosition(pos.symbol, pos.side, pos.amount);
-    if (result?.avgPrice && result.avgPrice > 0) closePrice = result.avgPrice;
+    if (!result) {
+      this.addLog(`ERROR: close failed ${pos.symbol} tradeId=${pos.tradeId}; position kept open`);
+      return;
+    }
+    const closePrice = result.avgPrice;
 
     const grossPnl = pos.side === 'LONG'
       ? (closePrice - pos.entryPrice) * pos.amount
@@ -1144,9 +1200,13 @@ export class ScalpingEngine {
 
     const { entryFee, exitFee } = entryExitFees(pos.entryPrice, closePrice, pos.amount);
     const netPnl = grossPnl - entryFee - exitFee;
+    const trade = this.tradeHistory.find(t => t.id === pos.tradeId);
+    const initialRiskUsd = trade?.initialRiskUsd ?? riskAtStop(pos);
+    const realizedR = initialRiskUsd > 0 ? netPnl / initialRiskUsd : 0;
+    const plannedExit = reason === 'TP' ? pos.takeProfit : reason === 'SL' ? pos.stopLoss : price;
+    const exitSlip = exitSlippageBps(pos.side, plannedExit, closePrice);
 
     // Update trade log
-    const trade = this.tradeHistory.find(t => t.id === pos.tradeId);
     if (trade) {
       trade.exitPrice     = closePrice;
       trade.grossPnl      = grossPnl;
@@ -1154,8 +1214,24 @@ export class ScalpingEngine {
       trade.exitFee       = exitFee;
       trade.netPnl        = netPnl;
       trade.pnl           = netPnl;
+      trade.exitSlippageBps = exitSlip;
+      trade.R             = realizedR;
       trade.status        = 'CLOSED';
       trade.exitTimestamp = Date.now();
+
+      appendTradeTelemetry({
+        tradeId: trade.id,
+        symbol: trade.symbol,
+        side: trade.side,
+        signalPrice: trade.signalPrice ?? trade.entryPrice,
+        fillPrice: trade.fillPrice ?? trade.entryPrice,
+        entrySlippageBps: trade.entrySlippageBps ?? 0,
+        exitSlippageBps: exitSlip,
+        feesUsd: entryFee + exitFee,
+        netPnlUsd: netPnl,
+        R: realizedR,
+        latencyMs: trade.latencyMs ?? 0,
+      }).catch((err) => this.addLog(`ERROR telemetry append failed: ${(err as Error).message}`));
     }
 
     // Portfolio: remove from risk registry and credit net PnL to shared balance

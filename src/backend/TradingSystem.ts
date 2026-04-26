@@ -14,6 +14,14 @@ import { StateStore, type EngineStateSnapshot } from './persistence/StateStore';
 import { PortfolioManager } from './portfolio/PortfolioManager';
 import { closedTradeNetAmount, entryExitFees, minTpDistanceForFees } from './fees';
 import { exchange } from './exchange/BinanceClient';
+import {
+  DAILY_LOSS_LIMIT_FRAC,
+  MAX_ENTRY_LATENCY_MS,
+  MAX_ENTRY_SLIPPAGE_BPS,
+  appendTradeTelemetry,
+  entrySlippageBps,
+  exitSlippageBps,
+} from './TradeLog';
 
 export type { TradeLog } from './types';
 
@@ -83,9 +91,11 @@ export class TradingSystem {
   private lastTradeOpenedAt = 0;
   private symbolLastClosedAt = new Map<string, number>();
   private lossStreakPauseUntil = 0;
+  private readonly startingBalance: number;
 
   constructor(portfolio: PortfolioManager, initialSnapshot?: EngineStateSnapshot | null) {
     this.portfolio = portfolio;
+    this.startingBalance = portfolio.getBalance();
 
     const snap = initialSnapshot ?? null;
     if (snap) {
@@ -343,17 +353,26 @@ export class TradingSystem {
       this.addLog(
         `EVAL ${symbol} score=${evaluation.finalScore.toFixed(1)} ${aiPart} final=EXECUTE reason=${truncate(evaluation.reason, 160)}`
       );
-      this.executeTrade(symbol, lastPrice, evaluation.side, data, market);
+      await this.executeTrade(symbol, lastPrice, evaluation.side, data, market);
     }
   }
 
-  private executeTrade(
+  private async executeTrade(
     symbol: string,
     price: number,
     side: 'LONG' | 'SHORT',
     ohlcv: OHLCV[],
     market: ReturnType<typeof analyzeMarketForTrading>
-  ) {
+  ): Promise<void> {
+    if (this.startingBalance > 0) {
+      const dailyPnl = this.portfolio.getBalance() - this.startingBalance;
+      if (dailyPnl <= -this.startingBalance * DAILY_LOSS_LIMIT_FRAC) {
+        this.addLog(`SKIP ${symbol} ${side} cause=daily_loss_limit pnl=${dailyPnl.toFixed(2)}`);
+        return;
+      }
+    }
+
+    const signalTimestamp = Date.now();
     // Per-engine position cap (swing only)
     if (this.activePositions.length >= MAX_OPEN_TRADES) {
       this.addLog(`SKIP ${symbol} ${side} cause=max_positions (${MAX_OPEN_TRADES})`);
@@ -401,19 +420,54 @@ export class TradingSystem {
       return;
     }
 
+    const order = await exchange.placeMarketOrder(symbol, side === 'LONG' ? 'BUY' : 'SELL', position.amount);
+    if (!order) {
+      this.addLog(`SKIP ${symbol} ${side} cause=order_failed`);
+      return;
+    }
+
+    const latencyMs = Date.now() - signalTimestamp;
+    const slippageBps = entrySlippageBps(side, price, order.avgPrice);
+    const guardRejected = latencyMs > MAX_ENTRY_LATENCY_MS || slippageBps > MAX_ENTRY_SLIPPAGE_BPS;
+    if (guardRejected) {
+      const cause = latencyMs > MAX_ENTRY_LATENCY_MS
+        ? `latency(${latencyMs}ms)`
+        : `entry_slippage(${slippageBps.toFixed(2)}bps)`;
+      const flattened = await exchange.closePosition(symbol, side, order.executedQty);
+      this.addLog(
+        `SKIP ${symbol} ${side} cause=${cause}; ` +
+        `entry_order=${order.orderId} flatten=${flattened ? 'ok' : 'failed'}`
+      );
+      if (flattened) return;
+    }
+
     const tradeId = randomUUID();
+    const fillOffset = order.avgPrice - price;
     position.tradeId  = tradeId;
     position.symbol   = symbol;
     position.engineId = ENGINE_ID;
+    position.exchangeOrderId = order.orderId;
+    position.entryPrice = order.avgPrice;
+    position.currentPrice = order.avgPrice;
+    position.amount = order.executedQty;
+    position.stopLoss += fillOffset;
+    position.takeProfit += fillOffset;
+    position.initialStopDist = Math.abs(position.entryPrice - position.stopLoss);
 
     this.activePositions.push(position);
 
     const trade: TradeLog = {
       id: tradeId,
+      signalPrice: price,
+      signalTimestamp,
+      fillPrice: order.avgPrice,
+      entrySlippageBps: slippageBps,
+      latencyMs,
+      initialRiskUsd: riskAtStop(position),
       symbol,
       side,
-      entryPrice: price,
-      amount: position.amount,
+      entryPrice: order.avgPrice,
+      amount: order.executedQty,
       status: 'OPEN',
       timestamp: Date.now(),
       source: 'swing',
@@ -423,14 +477,10 @@ export class TradingSystem {
     // Register risk with portfolio — synchronous, immediately after push
     this.portfolio.registerTrade(ENGINE_ID, tradeId, symbol, riskAtStop(position));
 
-    // Place live order on exchange (fire-and-forget — does not block local position registration)
-    exchange.placeMarketOrder(symbol, side === 'LONG' ? 'BUY' : 'SELL', position.amount)
-      .then(r => { if (r) position.exchangeOrderId = r.orderId; })
-      .catch(err => this.addLog(`[Exchange] Entry order failed: ${(err as Error).message}`));
-
     this.persistState();
     this.lastTradeOpenedAt = Date.now();
-    this.addLog(`OPEN ${side} ${symbol} @ ${price} (tradeId=${tradeId})`);
+    const guardNote = guardRejected ? ' guard_rejected_flatten_failed=true' : '';
+    this.addLog(`OPEN ${side} ${symbol} @ ${order.avgPrice} (signal=${price} slip=${slippageBps.toFixed(2)}bps tradeId=${tradeId})${guardNote}`);
   }
 
   private async monitorPositions() {
@@ -473,7 +523,11 @@ export class TradingSystem {
     // Attempt live close on exchange; use actual fill price if available
     let closePrice = price;
     const result = await exchange.closePosition(pos.symbol, pos.side, pos.amount);
-    if (result?.avgPrice && result.avgPrice > 0) closePrice = result.avgPrice;
+    if (!result) {
+      this.addLog(`ERROR: close failed ${pos.symbol} tradeId=${pos.tradeId}; position kept open`);
+      return;
+    }
+    if (result.avgPrice > 0) closePrice = result.avgPrice;
 
     const grossPnl =
       pos.side === 'LONG'
@@ -482,6 +536,13 @@ export class TradingSystem {
 
     const { entryFee, exitFee } = entryExitFees(pos.entryPrice, closePrice, pos.amount);
     const netPnl = grossPnl - entryFee - exitFee;
+    const initialRiskUsd = trade.initialRiskUsd ?? riskAtStop(pos);
+    const realizedR = initialRiskUsd > 0 ? netPnl / initialRiskUsd : 0;
+    const plannedExit =
+      reason === 'Take Profit' ? pos.takeProfit :
+      reason === 'Stop Loss' ? pos.stopLoss :
+      price;
+    const exitSlip = exitSlippageBps(pos.side, plannedExit, closePrice);
 
     // Portfolio: credit net PnL + remove from risk registry
     this.portfolio.closeTrade(pos.tradeId, netPnl);
@@ -492,8 +553,24 @@ export class TradingSystem {
     trade.exitFee       = exitFee;
     trade.netPnl        = netPnl;
     trade.pnl           = netPnl;
+    trade.exitSlippageBps = exitSlip;
+    trade.R             = realizedR;
     trade.status        = 'CLOSED';
     trade.exitTimestamp = Date.now();
+
+    appendTradeTelemetry({
+      tradeId: trade.id,
+      symbol: trade.symbol,
+      side: trade.side,
+      signalPrice: trade.signalPrice ?? trade.entryPrice,
+      fillPrice: trade.fillPrice ?? trade.entryPrice,
+      entrySlippageBps: trade.entrySlippageBps ?? 0,
+      exitSlippageBps: exitSlip,
+      feesUsd: entryFee + exitFee,
+      netPnlUsd: netPnl,
+      R: realizedR,
+      latencyMs: trade.latencyMs ?? 0,
+    }).catch((err) => this.addLog(`ERROR telemetry append failed: ${(err as Error).message}`));
 
     this.addLog(
       `CLOSE ${pos.symbol} @ ${closePrice} (${reason}). Net ${netPnl.toFixed(2)} (gross ${grossPnl.toFixed(2)} fees ${(entryFee + exitFee).toFixed(2)})`
