@@ -17,6 +17,7 @@ export interface EngineStateSnapshot {
   tradeHistory: TradeLog[];
   activePositions: Position[];
   lossStreakPauseUntil?: number;
+  performanceLockoutUntil?: number;
 }
 
 /** Unified file shape (single `state.json`). */
@@ -54,6 +55,10 @@ function normalizeEngine(e: Partial<EngineStateSnapshot> | null | undefined): En
     lossStreakPauseUntil:
       typeof e?.lossStreakPauseUntil === 'number' && Number.isFinite(e.lossStreakPauseUntil)
         ? e.lossStreakPauseUntil
+        : undefined,
+    performanceLockoutUntil:
+      typeof e?.performanceLockoutUntil === 'number' && Number.isFinite(e.performanceLockoutUntil)
+        ? e.performanceLockoutUntil
         : undefined,
   };
 }

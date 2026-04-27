@@ -204,6 +204,11 @@ const TRADE_COOLDOWN_MS    = 60_000;          // 1 min global cooldown between s
 const SYMBOL_POST_CLOSE_COOLDOWN_MS = 75_000; // per-symbol after close (30–120s band)
 const LOSS_STREAK_PAUSE_MS = 30 * 60_000;     // 30 min pause after 5 consecutive losses
 const LOSS_STREAK_COUNT    = 5;               // losses in a row before pause
+const PERFORMANCE_LOCKOUT_MS = 24 * 60 * 60_000; // hard stop after severe realized underperformance
+const PERFORMANCE_WINDOW_TRADES = 15;
+const PERFORMANCE_MIN_TRADES = 10;
+const PERFORMANCE_MIN_WIN_RATE = 0.15;
+const PERFORMANCE_MIN_PROFIT_FACTOR = 0.50;
 const MAX_POSITIONS        = 3;               // max concurrent scalp trades
 const SCALP_LEVERAGE       = 10;              // leverage set on exchange before first trade per symbol
 const NOTIONAL_FRAC        = 0.10;            // fraction of balance used as MARGIN per trade
@@ -314,6 +319,8 @@ export class ScalpingEngine {
   private lastTradeOpenedAt = 0;
   private symbolLastClosedAt = new Map<string, number>();
   private lossStreakPauseUntil = 0;
+  private performanceLockoutUntil = 0;
+  private lastPerformanceLockoutLogMin = -1;
   private watchlist: string[] = [];
   /** 1m OHLCV per symbol for HTF trend + ATR (TTL refresh). */
   private ohlcvCache = new Map<string, { bars: OHLCV[]; fetchedAt: number }>();
@@ -345,6 +352,7 @@ export class ScalpingEngine {
       this.activePositions    = snap.activePositions ?? [];
       this.tradeHistory       = snap.tradeHistory ?? [];
       this.lossStreakPauseUntil = snap.lossStreakPauseUntil ?? 0;
+      this.performanceLockoutUntil = snap.performanceLockoutUntil ?? 0;
 
       // Re-register surviving open positions with the portfolio risk registry
       for (const pos of this.activePositions) {
@@ -420,6 +428,14 @@ export class ScalpingEngine {
     return this.lastSignalBySymbol.get(symbol.toUpperCase()) ?? null;
   }
 
+  private getPerformanceLockoutReason(): string | null {
+    const pauseUntil = Math.max(this.lossStreakPauseUntil, this.performanceLockoutUntil);
+    if (Date.now() >= pauseUntil) return null;
+    return this.performanceLockoutUntil >= this.lossStreakPauseUntil
+      ? 'performance_guard'
+      : 'loss_streak_pause';
+  }
+
   /** Refresh in-memory signals for every panel symbol (each scan tick). */
   private async refreshPanelSignals(): Promise<void> {
     for (const raw of this.getPanelWatchlistSymbols()) {
@@ -427,8 +443,13 @@ export class ScalpingEngine {
       const timestamp = Date.now();
       const put = (s: ScalpLastSignal) => this.lastSignalBySymbol.set(symbol, s);
 
+      const lockoutReason = this.getPerformanceLockoutReason();
       if (!this.isRunning) {
         put({ decision: 'SKIP', score: 0, reason: 'engine_stopped', timestamp });
+        continue;
+      }
+      if (lockoutReason) {
+        put({ decision: 'SKIP', score: 0, reason: lockoutReason, timestamp });
         continue;
       }
       if (!this.watchlist.includes(symbol)) {
@@ -793,11 +814,17 @@ export class ScalpingEngine {
   private async scanAndTrade(): Promise<void> {
     await this.refreshPanelSignals();
 
-    // Pause check
-    if (Date.now() < this.lossStreakPauseUntil) {
-      const secsLeft = Math.ceil((this.lossStreakPauseUntil - Date.now()) / 1000);
+    this.checkPerformanceLockout();
+
+    // Pause / lockout check
+    const pauseUntil = Math.max(this.lossStreakPauseUntil, this.performanceLockoutUntil);
+    if (Date.now() < pauseUntil) {
+      const secsLeft = Math.ceil((pauseUntil - Date.now()) / 1000);
+      const label = this.performanceLockoutUntil >= this.lossStreakPauseUntil
+        ? 'performance_guard'
+        : 'loss_streak';
       if (secsLeft % 60 < (LOOP_INTERVAL_MS / 1000)) {
-        this.addLog(`PAUSED loss_streak ~${Math.ceil(secsLeft / 60)}min remaining`);
+        this.addLog(`PAUSED ${label} ~${Math.ceil(secsLeft / 60)}min remaining`);
       }
       return;
     }
@@ -1292,6 +1319,7 @@ export class ScalpingEngine {
     );
 
     this.checkLossStreak();
+    this.checkPerformanceLockout();
     this.persistState();
   }
 
@@ -1312,6 +1340,39 @@ export class ScalpingEngine {
     }
   }
 
+  private checkPerformanceLockout(): void {
+    if (Date.now() < this.performanceLockoutUntil) return;
+
+    const recent = this.tradeHistory
+      .filter(t => closedTradeNetAmount(t) != null)
+      .slice(-PERFORMANCE_WINDOW_TRADES);
+    if (recent.length < PERFORMANCE_MIN_TRADES) return;
+
+    const net = (t: TradeLog) => closedTradeNetAmount(t) as number;
+    const wins = recent.filter(t => net(t) > 0);
+    const losses = recent.filter(t => net(t) < 0);
+    const totalNet = recent.reduce((sum, t) => sum + net(t), 0);
+    if (totalNet >= 0 || losses.length === 0) return;
+
+    const winRate = wins.length / recent.length;
+    const sumWins = wins.reduce((sum, t) => sum + net(t), 0);
+    const sumLosses = Math.abs(losses.reduce((sum, t) => sum + net(t), 0));
+    const profitFactor = sumLosses > 0 ? sumWins / sumLosses : 0;
+
+    if (
+      wins.length === 0 ||
+      winRate < PERFORMANCE_MIN_WIN_RATE ||
+      profitFactor < PERFORMANCE_MIN_PROFIT_FACTOR
+    ) {
+      this.performanceLockoutUntil = Date.now() + PERFORMANCE_LOCKOUT_MS;
+      this.lastPerformanceLockoutLogMin = -1;
+      this.addLog(
+        `PAUSE 24h — scalp_performance_lockout trades=${recent.length} ` +
+        `winRate=${(winRate * 100).toFixed(1)}% pf=${profitFactor.toFixed(2)} net=${totalNet.toFixed(2)}`
+      );
+    }
+  }
+
   private persistState(): void {
     StateStore.scheduleSave();
   }
@@ -1323,6 +1384,8 @@ export class ScalpingEngine {
       activePositions: this.activePositions,
       lossStreakPauseUntil:
         this.lossStreakPauseUntil > Date.now() ? this.lossStreakPauseUntil : undefined,
+      performanceLockoutUntil:
+        this.performanceLockoutUntil > Date.now() ? this.performanceLockoutUntil : undefined,
     };
   }
 
