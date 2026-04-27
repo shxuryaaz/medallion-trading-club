@@ -35,6 +35,7 @@ export interface TradeLog {
   feesUsd?: number;
   netPnlUsd?: number;
   R?: number;
+  primaryLossCause?: 'signal_failure' | 'slippage' | 'fees' | 'late_entry';
 
   createdAt: number;
   closedAt?: number;

@@ -10,6 +10,7 @@ export const DAILY_LOSS_LIMIT_FRAC = 0.02;
 
 export type TradeSource = 'swing' | 'scalp';
 export type TradeExitReason = 'TP' | 'SL' | 'MANUAL' | 'ERROR';
+export type PrimaryLossCause = 'signal_failure' | 'slippage' | 'fees' | 'late_entry';
 
 export interface TradeLog {
   id: string;
@@ -48,6 +49,7 @@ export interface TradeLog {
   feesUsd?: number;
   netPnlUsd?: number;
   R?: number;
+  primaryLossCause?: PrimaryLossCause;
 
   createdAt: number;
   closedAt?: number;

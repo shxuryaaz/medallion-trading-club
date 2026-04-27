@@ -18,6 +18,8 @@ export interface EngineStateSnapshot {
   activePositions: Position[];
   lossStreakPauseUntil?: number;
   performanceLockoutUntil?: number;
+  softPauseUntil?: number;
+  riskMultiplier?: number;
 }
 
 /** Unified file shape (single `state.json`). */
@@ -59,6 +61,14 @@ function normalizeEngine(e: Partial<EngineStateSnapshot> | null | undefined): En
     performanceLockoutUntil:
       typeof e?.performanceLockoutUntil === 'number' && Number.isFinite(e.performanceLockoutUntil)
         ? e.performanceLockoutUntil
+        : undefined,
+    softPauseUntil:
+      typeof e?.softPauseUntil === 'number' && Number.isFinite(e.softPauseUntil)
+        ? e.softPauseUntil
+        : undefined,
+    riskMultiplier:
+      typeof e?.riskMultiplier === 'number' && Number.isFinite(e.riskMultiplier)
+        ? e.riskMultiplier
         : undefined,
   };
 }

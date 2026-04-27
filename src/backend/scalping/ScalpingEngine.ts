@@ -24,6 +24,12 @@ import {
   plannedRiskReward,
 } from '../TradeLog';
 import { StrategyVersionManager } from '../evolution/StrategyVersionManager';
+import {
+  classifyLossCause,
+  evaluateRiskGovernor,
+  getLossBreakdown,
+  type ScalpRiskState,
+} from './riskGovernor';
 
 // ── Indicator helpers (inlined — no dependency on swing engine math) ──────────
 
@@ -204,11 +210,6 @@ const TRADE_COOLDOWN_MS    = 60_000;          // 1 min global cooldown between s
 const SYMBOL_POST_CLOSE_COOLDOWN_MS = 75_000; // per-symbol after close (30–120s band)
 const LOSS_STREAK_PAUSE_MS = 30 * 60_000;     // 30 min pause after 5 consecutive losses
 const LOSS_STREAK_COUNT    = 5;               // losses in a row before pause
-const PERFORMANCE_LOCKOUT_MS = 24 * 60 * 60_000; // hard stop after severe realized underperformance
-const PERFORMANCE_WINDOW_TRADES = 15;
-const PERFORMANCE_MIN_TRADES = 10;
-const PERFORMANCE_MIN_WIN_RATE = 0.15;
-const PERFORMANCE_MIN_PROFIT_FACTOR = 0.50;
 const MAX_POSITIONS        = 3;               // max concurrent scalp trades
 const SCALP_LEVERAGE       = 10;              // leverage set on exchange before first trade per symbol
 const NOTIONAL_FRAC        = 0.10;            // fraction of balance used as MARGIN per trade
@@ -319,8 +320,8 @@ export class ScalpingEngine {
   private lastTradeOpenedAt = 0;
   private symbolLastClosedAt = new Map<string, number>();
   private lossStreakPauseUntil = 0;
-  private performanceLockoutUntil = 0;
-  private lastPerformanceLockoutLogMin = -1;
+  private scalpState: ScalpRiskState = { riskMultiplier: 1 };
+  private lastRiskPauseLogMin = -1;
   private watchlist: string[] = [];
   /** 1m OHLCV per symbol for HTF trend + ATR (TTL refresh). */
   private ohlcvCache = new Map<string, { bars: OHLCV[]; fetchedAt: number }>();
@@ -352,7 +353,11 @@ export class ScalpingEngine {
       this.activePositions    = snap.activePositions ?? [];
       this.tradeHistory       = snap.tradeHistory ?? [];
       this.lossStreakPauseUntil = snap.lossStreakPauseUntil ?? 0;
-      this.performanceLockoutUntil = snap.performanceLockoutUntil ?? 0;
+      this.scalpState = {
+        performanceLockoutUntil: snap.performanceLockoutUntil,
+        softPauseUntil: snap.softPauseUntil,
+        riskMultiplier: snap.riskMultiplier ?? 1,
+      };
 
       // Re-register surviving open positions with the portfolio risk registry
       for (const pos of this.activePositions) {
@@ -429,9 +434,14 @@ export class ScalpingEngine {
   }
 
   private getPerformanceLockoutReason(): string | null {
-    const pauseUntil = Math.max(this.lossStreakPauseUntil, this.performanceLockoutUntil);
+    const pauseUntil = Math.max(
+      this.lossStreakPauseUntil,
+      this.scalpState.softPauseUntil ?? 0,
+      this.scalpState.performanceLockoutUntil ?? 0
+    );
     if (Date.now() >= pauseUntil) return null;
-    return this.performanceLockoutUntil >= this.lossStreakPauseUntil
+    if ((this.scalpState.performanceLockoutUntil ?? 0) >= pauseUntil) return 'performance_guard';
+    return (this.scalpState.softPauseUntil ?? 0) >= this.lossStreakPauseUntil
       ? 'performance_guard'
       : 'loss_streak_pause';
   }
@@ -597,7 +607,8 @@ export class ScalpingEngine {
     }
 
     let executionNote: string | undefined;
-    if (Date.now() < this.lossStreakPauseUntil) executionNote = 'loss_streak_pause';
+    const lockoutReason = this.getPerformanceLockoutReason();
+    if (lockoutReason) executionNote = lockoutReason;
     else if (this.activePositions.length >= MAX_POSITIONS) executionNote = 'max_positions';
     else if (this.lastTradeOpenedAt > 0 && Date.now() - this.lastTradeOpenedAt < TRADE_COOLDOWN_MS) {
       executionNote = 'global_cooldown';
@@ -814,15 +825,17 @@ export class ScalpingEngine {
   private async scanAndTrade(): Promise<void> {
     await this.refreshPanelSignals();
 
-    this.checkPerformanceLockout();
+    this.applyRiskGovernor();
 
     // Pause / lockout check
-    const pauseUntil = Math.max(this.lossStreakPauseUntil, this.performanceLockoutUntil);
+    const pauseUntil = Math.max(
+      this.lossStreakPauseUntil,
+      this.scalpState.softPauseUntil ?? 0,
+      this.scalpState.performanceLockoutUntil ?? 0
+    );
     if (Date.now() < pauseUntil) {
       const secsLeft = Math.ceil((pauseUntil - Date.now()) / 1000);
-      const label = this.performanceLockoutUntil >= this.lossStreakPauseUntil
-        ? 'performance_guard'
-        : 'loss_streak';
+      const label = this.getPerformanceLockoutReason() ?? 'risk_pause';
       if (secsLeft % 60 < (LOOP_INTERVAL_MS / 1000)) {
         this.addLog(`PAUSED ${label} ~${Math.ceil(secsLeft / 60)}min remaining`);
       }
@@ -1061,7 +1074,7 @@ export class ScalpingEngine {
     }
 
     const balance  = this.portfolio.getBalance();
-    const scale    = scoreToNotionalScale(entryQuality.score);
+    const scale    = scoreToNotionalScale(entryQuality.score) * this.scalpState.riskMultiplier;
     // Notional = margin × leverage (the actual position size sent to exchange)
     const notional = balance * NOTIONAL_FRAC * SCALP_LEVERAGE * scale;
     const amount   = notional / price;
@@ -1266,17 +1279,29 @@ export class ScalpingEngine {
 
     // Update trade log
     if (trade) {
+      const feesUsd = entryFee + exitFee;
+      const primaryLossCause = classifyLossCause({
+        trade: {
+          ...trade,
+          R: realizedR,
+          netPnlUsd: netPnl,
+          exitReason: mapExitReason(reason),
+        },
+        feesUsd,
+        grossPnlUsd: grossPnl,
+      });
       trade.exitPrice     = closePrice;
       trade.grossPnl      = grossPnl;
       trade.entryFee      = entryFee;
       trade.exitFee       = exitFee;
       trade.netPnl        = netPnl;
       trade.pnl           = netPnl;
-      trade.feesUsd       = entryFee + exitFee;
+      trade.feesUsd       = feesUsd;
       trade.netPnlUsd     = netPnl;
       trade.exitReason    = mapExitReason(reason);
       trade.exitSlippageBps = exitSlip;
       trade.R             = realizedR;
+      trade.primaryLossCause = primaryLossCause;
       trade.status        = 'CLOSED';
       trade.closedAt      = Date.now();
       trade.exitTimestamp = trade.closedAt;
@@ -1299,7 +1324,7 @@ export class ScalpingEngine {
         fillPrice: trade.fillPrice ?? trade.entryPrice,
         entrySlippageBps: trade.entrySlippageBps ?? 0,
         exitSlippageBps: exitSlip,
-        feesUsd: entryFee + exitFee,
+        feesUsd,
         netPnlUsd: netPnl,
         R: realizedR,
         latencyMs: trade.latencyMs ?? 0,
@@ -1319,7 +1344,8 @@ export class ScalpingEngine {
     );
 
     this.checkLossStreak();
-    this.checkPerformanceLockout();
+    this.applyRiskGovernor();
+    this.logLossBreakdownIfDue();
     this.persistState();
   }
 
@@ -1340,37 +1366,37 @@ export class ScalpingEngine {
     }
   }
 
-  private checkPerformanceLockout(): void {
-    if (Date.now() < this.performanceLockoutUntil) return;
-
-    const recent = this.tradeHistory
-      .filter(t => closedTradeNetAmount(t) != null)
-      .slice(-PERFORMANCE_WINDOW_TRADES);
-    if (recent.length < PERFORMANCE_MIN_TRADES) return;
-
-    const net = (t: TradeLog) => closedTradeNetAmount(t) as number;
-    const wins = recent.filter(t => net(t) > 0);
-    const losses = recent.filter(t => net(t) < 0);
-    const totalNet = recent.reduce((sum, t) => sum + net(t), 0);
-    if (totalNet >= 0 || losses.length === 0) return;
-
-    const winRate = wins.length / recent.length;
-    const sumWins = wins.reduce((sum, t) => sum + net(t), 0);
-    const sumLosses = Math.abs(losses.reduce((sum, t) => sum + net(t), 0));
-    const profitFactor = sumLosses > 0 ? sumWins / sumLosses : 0;
-
-    if (
-      wins.length === 0 ||
-      winRate < PERFORMANCE_MIN_WIN_RATE ||
-      profitFactor < PERFORMANCE_MIN_PROFIT_FACTOR
-    ) {
-      this.performanceLockoutUntil = Date.now() + PERFORMANCE_LOCKOUT_MS;
-      this.lastPerformanceLockoutLogMin = -1;
-      this.addLog(
-        `PAUSE 24h — scalp_performance_lockout trades=${recent.length} ` +
-        `winRate=${(winRate * 100).toFixed(1)}% pf=${profitFactor.toFixed(2)} net=${totalNet.toFixed(2)}`
-      );
+  private applyRiskGovernor(): void {
+    const decision = evaluateRiskGovernor(this.tradeHistory);
+    const now = Date.now();
+    this.scalpState.riskMultiplier = decision.riskMultiplier;
+    if (decision.level === 'soft_disable') {
+      this.scalpState.softPauseUntil = Math.max(this.scalpState.softPauseUntil ?? 0, now + decision.pauseMs);
+    } else if ((this.scalpState.softPauseUntil ?? 0) <= now) {
+      this.scalpState.softPauseUntil = undefined;
     }
+    if (decision.level === 'hard_lockout') {
+      this.scalpState.performanceLockoutUntil = Math.max(
+        this.scalpState.performanceLockoutUntil ?? 0,
+        now + decision.pauseMs
+      );
+    } else if ((this.scalpState.performanceLockoutUntil ?? 0) <= now) {
+      this.scalpState.performanceLockoutUntil = undefined;
+    }
+
+    if (decision.level === 'early_warning' && decision.reason) {
+      this.addLog(`RISK: early_warning ${decision.reason}`);
+    } else if (decision.level === 'soft_disable' && decision.reason) {
+      this.addLog(`RISK: soft_disable ${decision.reason}`);
+    } else if (decision.level === 'hard_lockout' && decision.reason) {
+      this.addLog(`RISK: hard_lockout ${decision.reason}`);
+    }
+  }
+
+  private logLossBreakdownIfDue(): void {
+    const closedCount = this.tradeHistory.filter(t => closedTradeNetAmount(t) != null).length;
+    if (closedCount === 0 || closedCount % 10 !== 0) return;
+    this.addLog(`LOSS_BREAKDOWN: ${JSON.stringify(getLossBreakdown(this.tradeHistory))}`);
   }
 
   private persistState(): void {
@@ -1385,7 +1411,14 @@ export class ScalpingEngine {
       lossStreakPauseUntil:
         this.lossStreakPauseUntil > Date.now() ? this.lossStreakPauseUntil : undefined,
       performanceLockoutUntil:
-        this.performanceLockoutUntil > Date.now() ? this.performanceLockoutUntil : undefined,
+        (this.scalpState.performanceLockoutUntil ?? 0) > Date.now()
+          ? this.scalpState.performanceLockoutUntil
+          : undefined,
+      softPauseUntil:
+        (this.scalpState.softPauseUntil ?? 0) > Date.now()
+          ? this.scalpState.softPauseUntil
+          : undefined,
+      riskMultiplier: this.scalpState.riskMultiplier,
     };
   }
 
