@@ -3,16 +3,23 @@ import path from 'path';
 import type { Position } from '../Engine';
 import type { TradeLog } from '../types';
 
-const DATA_DIR = path.join(process.cwd(), 'data');
+const DATA_DIR = process.env.DATA_DIR?.trim() || path.join(process.cwd(), 'data');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const DEBOUNCE_MS = 200;
 const MAX_TRADES_PER_ENGINE = 500;
+const LIVE_TRADING_ENABLED = process.env.BINANCE_ENABLED === 'true';
+const REQUIRE_PERSISTED_STATE_ON_LIVE =
+  process.env.REQUIRE_PERSISTED_STATE === 'true' ||
+  process.env.REQUIRE_PERSISTED_STATE_ON_LIVE === 'true';
 
 /** Per-engine persisted slice (swing / scalp). */
 export interface EngineStateSnapshot {
   tradeHistory: TradeLog[];
   activePositions: Position[];
   lossStreakPauseUntil?: number;
+  performanceLockoutUntil?: number;
+  softPauseUntil?: number;
+  riskMultiplier?: number;
 }
 
 /** Unified file shape (single `state.json`). */
@@ -35,6 +42,14 @@ function freshState(): PersistedState {
   };
 }
 
+function warnFreshLiveState(reason: string): void {
+  console.warn(
+    `[STATE] WARNING: starting with fresh empty state while BINANCE_ENABLED=true (${reason}). ` +
+      `Trading will continue, but local trade history/open-position memory may be incomplete. ` +
+      `Configure DATA_DIR to durable storage when available. stateFile=${STATE_FILE}`
+  );
+}
+
 function normalizeEngine(e: Partial<EngineStateSnapshot> | null | undefined): EngineStateSnapshot {
   return {
     tradeHistory: Array.isArray(e?.tradeHistory) ? e!.tradeHistory : [],
@@ -42,6 +57,18 @@ function normalizeEngine(e: Partial<EngineStateSnapshot> | null | undefined): En
     lossStreakPauseUntil:
       typeof e?.lossStreakPauseUntil === 'number' && Number.isFinite(e.lossStreakPauseUntil)
         ? e.lossStreakPauseUntil
+        : undefined,
+    performanceLockoutUntil:
+      typeof e?.performanceLockoutUntil === 'number' && Number.isFinite(e.performanceLockoutUntil)
+        ? e.performanceLockoutUntil
+        : undefined,
+    softPauseUntil:
+      typeof e?.softPauseUntil === 'number' && Number.isFinite(e.softPauseUntil)
+        ? e.softPauseUntil
+        : undefined,
+    riskMultiplier:
+      typeof e?.riskMultiplier === 'number' && Number.isFinite(e.riskMultiplier)
+        ? e.riskMultiplier
         : undefined,
   };
 }
@@ -163,9 +190,12 @@ function validatePersisted(raw: unknown): PersistedState | null {
 }
 
 /**
- * Load persisted trading state. Never throws: corrupted / missing → migrate or fresh defaults.
+ * Load persisted trading state. Missing state stays non-fatal by default so free
+ * ephemeral hosts can keep trading; set REQUIRE_PERSISTED_STATE_ON_LIVE=true to
+ * make missing/invalid live state fatal.
  */
 export async function loadState(): Promise<PersistedState> {
+  let fallbackReason = 'state.json missing';
   try {
     const raw = await fs.readFile(STATE_FILE, 'utf8');
     const parsed = JSON.parse(raw) as unknown;
@@ -182,10 +212,12 @@ export async function loadState(): Promise<PersistedState> {
       );
       return normalized;
     }
+    fallbackReason = 'state.json invalid or incomplete shape';
     console.warn('[STATE] state.json invalid or incomplete shape — fallback / migrate');
   } catch (e: unknown) {
     const err = e as NodeJS.ErrnoException;
     if (err?.code !== 'ENOENT') {
+      fallbackReason = 'state.json unreadable or corrupted';
       console.warn('[STATE] state.json unreadable or corrupted — fallback / migrate:', e);
     }
   }
@@ -195,6 +227,16 @@ export async function loadState(): Promise<PersistedState> {
     const { open, closed } = tradeCounts(migrated);
     console.log(`[STATE] Loaded balance=${migrated.balance.toFixed(2)} open=${open} closed=${closed}`);
     return migrated;
+  }
+
+  if (LIVE_TRADING_ENABLED) {
+    if (REQUIRE_PERSISTED_STATE_ON_LIVE) {
+      throw new Error(
+        `[STATE] Refusing to start with fresh empty state while BINANCE_ENABLED=true (${fallbackReason}). ` +
+          `Configure DATA_DIR to durable storage and restore ${STATE_FILE}, or unset REQUIRE_PERSISTED_STATE_ON_LIVE.`
+      );
+    }
+    warnFreshLiveState(fallbackReason);
   }
 
   const fresh = freshState();

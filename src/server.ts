@@ -16,9 +16,53 @@ import { ScoringEngine } from './backend/Engine.ts';
 import { exchange } from './backend/exchange/BinanceClient.ts';
 import { runBacktest } from './backend/backtest/BacktestRunner.ts';
 import { classifyWatchlistTicks } from './backend/watchlistTickClassify.ts';
+import type { TradeLog } from './backend/types.ts';
+import { PerformanceAnalyzer } from './backend/evolution/PerformanceAnalyzer.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+function liveTradeSnapshot(trade: TradeLog, activePositions: any[]): TradeLog {
+  const pos = activePositions.find((p) => p.tradeId === trade.id);
+  if (!pos || typeof pos.currentPrice !== 'number') return trade;
+
+  const currentPrice = pos.currentPrice;
+  const fillPrice = trade.fillPrice ?? trade.entryPrice;
+  const amount = trade.amount;
+  const plannedStopLoss = trade.plannedStopLoss ?? pos.stopLoss;
+  const plannedTakeProfit = trade.plannedTakeProfit ?? pos.takeProfit;
+  const unrealizedPnlUsd =
+    trade.side === 'LONG'
+      ? (currentPrice - fillPrice) * amount
+      : (fillPrice - currentPrice) * amount;
+  const distanceToStopBps =
+    currentPrice > 0
+      ? trade.side === 'LONG'
+        ? ((currentPrice - plannedStopLoss) / currentPrice) * 10_000
+        : ((plannedStopLoss - currentPrice) / currentPrice) * 10_000
+      : 0;
+  const distanceToTakeProfitBps =
+    currentPrice > 0
+      ? trade.side === 'LONG'
+        ? ((plannedTakeProfit - currentPrice) / currentPrice) * 10_000
+        : ((currentPrice - plannedTakeProfit) / currentPrice) * 10_000
+      : 0;
+
+  return {
+    ...trade,
+    currentPrice,
+    unrealizedPnlUsd,
+    distanceToStopBps,
+    distanceToTakeProfitBps,
+  };
+}
+
+function buildTradeAuditList(swingStatus: ReturnType<TradingSystem['getStatus']>, scalpStatus: ReturnType<ScalpingEngine['getStatus']>): TradeLog[] {
+  const activePositions = [...swingStatus.activePositions, ...scalpStatus.activePositions];
+  return [...swingStatus.tradeHistory, ...scalpStatus.tradeHistory]
+    .map((trade) => liveTradeSnapshot(trade, activePositions))
+    .sort((a, b) => (b.createdAt ?? b.timestamp) - (a.createdAt ?? a.timestamp));
+}
 
 async function startServer() {
   const app = express();
@@ -146,6 +190,92 @@ async function startServer() {
     }
   });
 
+  app.get('/api/trades', async (req, res) => {
+    try {
+      try { await swingEngine.refreshOpenPositionMarks(); } catch (e) {
+        console.error('[api/trades] swing refresh:', e);
+      }
+      try { await scalpEngine.refreshOpenPositionMarks(); } catch (e) {
+        console.error('[api/trades] scalp refresh:', e);
+      }
+
+      const swingStatus = swingEngine.getStatus();
+      const scalpStatus = scalpEngine.getStatus();
+      let trades = buildTradeAuditList(swingStatus, scalpStatus);
+
+      if (req.query.status === 'OPEN' || req.query.status === 'CLOSED') {
+        trades = trades.filter((t) => t.status === req.query.status);
+      }
+      if (req.query.source === 'swing' || req.query.source === 'scalp') {
+        trades = trades.filter((t) => t.source === req.query.source);
+      }
+      if (typeof req.query.symbol === 'string' && req.query.symbol.length > 0) {
+        const symbol = req.query.symbol.toUpperCase();
+        trades = trades.filter((t) => t.symbol.toUpperCase() === symbol);
+      }
+
+      const rawLimit = typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : 100;
+      const limit = Math.min(500, Math.max(1, Number.isFinite(rawLimit) ? rawLimit : 100));
+      res.json({ trades: trades.slice(0, limit) });
+    } catch (e) {
+      console.error('[api/trades]', e);
+      res.status(500).json({ error: String(e) });
+    }
+  });
+
+  app.get('/api/trades/:id', async (req, res) => {
+    try {
+      try { await swingEngine.refreshOpenPositionMarks(); } catch (e) {
+        console.error('[api/trades/:id] swing refresh:', e);
+      }
+      try { await scalpEngine.refreshOpenPositionMarks(); } catch (e) {
+        console.error('[api/trades/:id] scalp refresh:', e);
+      }
+
+      const trade = buildTradeAuditList(swingEngine.getStatus(), scalpEngine.getStatus())
+        .find((t) => t.id === req.params.id);
+      if (!trade) return res.status(404).json({ error: 'Trade not found' });
+      res.json(trade);
+    } catch (e) {
+      console.error('[api/trades/:id]', e);
+      res.status(500).json({ error: String(e) });
+    }
+  });
+
+  app.get('/api/binance/user-trades', async (req, res) => {
+    const symbol = typeof req.query.symbol === 'string' ? req.query.symbol.toUpperCase() : '';
+    if (!symbol) {
+      return res.status(400).json({ error: 'symbol query param is required' });
+    }
+
+    const parseOptionalMs = (value: unknown): number | undefined => {
+      if (typeof value !== 'string' || value.length === 0) return undefined;
+      const n = Number(value);
+      return Number.isFinite(n) ? n : undefined;
+    };
+
+    try {
+      const trades = await exchange.getRecentUserTrades({
+        symbol,
+        startTime: parseOptionalMs(req.query.startTime),
+        endTime: parseOptionalMs(req.query.endTime),
+        limit:
+          typeof req.query.limit === 'string' && Number.isFinite(Number(req.query.limit))
+            ? Number(req.query.limit)
+            : undefined,
+      });
+      res.json({
+        symbol,
+        trades,
+        note:
+          'Raw Binance futures fills include exchange price/qty/fees/realizedPnl, but not bot-only fields like planned SL/TP or strategy reason.',
+      });
+    } catch (e) {
+      console.error('[api/binance/user-trades]', e);
+      res.status(500).json({ error: String(e) });
+    }
+  });
+
   app.get('/api/performance', (req, res) => {
     const swingStats = swingEngine.getPerformanceStats();
     const scalpStats = scalpEngine.getPerformanceStats();
@@ -162,6 +292,18 @@ async function startServer() {
     };
 
     res.json({ combined, swing: swingStats, scalp: scalpStats });
+  });
+
+  app.get('/api/performance/versions', (req, res) => {
+    try {
+      const swingStatus = swingEngine.getStatus();
+      const scalpStatus = scalpEngine.getStatus();
+      const trades = buildTradeAuditList(swingStatus, scalpStatus);
+      res.json({ versions: PerformanceAnalyzer.analyzeByVersion(trades) });
+    } catch (e) {
+      console.error('[api/performance/versions]', e);
+      res.status(500).json({ error: String(e) });
+    }
   });
 
   app.post('/api/backtest', async (req, res) => {
